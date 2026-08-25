@@ -1,6 +1,6 @@
 // ============================================================
-// Rclone Storage Wrapper — Terabox Primary (Direct WebDAV)
-// Direct Rclone connection to Terabox (no Alist middleware needed)
+// Rclone Storage Wrapper — Google Drive Primary
+// Direct Rclone connection to Google Drive
 // ============================================================
 const { execFile, spawn } = require('child_process');
 const path = require('path');
@@ -10,13 +10,14 @@ const { retryWithBackoff, shouldRetryError } = require('./retryLogic');
 const StorageErrorLogger = require('./storageErrorLogger');
 const LocalStorage = require('./local_storage');
 
-// Configuration for direct Rclone WebDAV connection
+// Configuration for Google Drive via Rclone
 let rcloneConfig = {
-    teraboxUser: process.env.TERABOX_USER || null,
-    teraboxPass: process.env.TERABOX_PASS || null,
+    remote: process.env.RCLONE_REMOTE || 'gdrive',
+    configPath: process.env.RCLONE_CONFIG_PATH || './rclone.conf',
     source: 'ENV_VAR'
 };
 
+// Legacy Alist configuration (kept for backward compatibility but not used for storage)
 const alistDomain = process.env.ALIST_URL || 'http://127.0.0.1:5244';
 const alistCredentials = {
     username: process.env.ALIST_ADMIN_USERNAME || 'admin',
@@ -176,18 +177,16 @@ async function backupLocalFile(storagePath) {
 }
 
 async function remoteFileExists(storagePath) {
-    const token = await getAlistToken();
-    const response = await fetch(`${alistDomain}/api/fs/get`, {
-        method: 'POST',
-        headers: {
-            'Authorization': token,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ path: alistPath(storagePath) }),
-        signal: AbortSignal.timeout(30 * 1000)
-    });
-    const data = await response.json();
-    return response.ok && data.code === 200 && Boolean(data.data?.raw_url);
+    const remotePath = `${PRIMARY_REMOTE}:${storagePath}`;
+    try {
+        await rcloneExec(['ls', remotePath]);
+        return true;
+    } catch (err) {
+        if (/not found|error 404/i.test(err.message)) {
+            return false;
+        }
+        throw err;
+    }
 }
 
 async function processSyncQueue() {
@@ -281,8 +280,8 @@ function logOperation(operation, details = {}) {
 }
 
 // Rclone remote names (must match rclone.conf)
-const PRIMARY_REMOTE = process.env.RCLONE_PRIMARY_REMOTE || 'terabox';
-const BACKUP_REMOTE = process.env.RCLONE_BACKUP_REMOTE || 'storj';
+const PRIMARY_REMOTE = process.env.RCLONE_REMOTE || 'gdrive';
+const BACKUP_REMOTE = process.env.RCLONE_BACKUP_REMOTE || 'b2';  // Optional backup to B2
 const BASE_PATH = process.env.RCLONE_BASE_PATH || '/arsip';
 
 const isWindows = process.platform === 'win32';
@@ -363,7 +362,7 @@ async function readAlistResponse(response, operation) {
 
 const RcloneStorage = {
     /**
-     * Get a file from Terabox via Rclone.
+     * Get a file from Google Drive via Rclone.
      * Returns stream for use in downloads/previews.
      */
     async getStream(storagePath) {
@@ -373,28 +372,32 @@ const RcloneStorage = {
         });
 
         try {
-            const token = await getAlistToken();
-            const response = await fetch(`${alistDomain}/api/fs/get`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': token,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ path: alistPath(storagePath) })
+            // Stream file directly from Google Drive via rclone
+            const remotePath = `${PRIMARY_REMOTE}:${storagePath}`;
+            
+            return new Promise((resolve, reject) => {
+                const child = spawn(rclonePath, ['cat', remotePath], {
+                    env: { ...process.env, RCLONE_CONFIG: rcloneConfig.configPath }
+                });
+                
+                let hasStarted = false;
+                child.stdout.on('data', () => { hasStarted = true; });
+                child.on('error', reject);
+                child.stderr.on('data', (chunk) => {
+                    if (!hasStarted) console.warn(`[rclone cat stderr] ${chunk.toString()}`);
+                });
+                
+                child.on('close', (code) => {
+                    if (code !== 0 && !hasStarted) {
+                        reject(new Error(`rclone cat failed with code ${code}`));
+                    }
+                });
+                
+                resolve(child.stdout);
             });
-            const data = await response.json();
-            if (!response.ok || data.code !== 200 || !data.data?.raw_url) {
-                throw new Error(`Alist file lookup failed: ${data.message || `HTTP ${response.status}`}`);
-            }
-
-            const fileResponse = await fetch(data.data.raw_url);
-            if (!fileResponse.ok || !fileResponse.body) {
-                throw new Error(`Alist file stream failed: HTTP ${fileResponse.status}`);
-            }
-            return require('stream').Readable.fromWeb(fileResponse.body);
         } catch (remoteError) {
             if (LocalStorage.fileExists(storagePath)) {
-                console.warn(`[Storage] Terabox preview unavailable; serving local copy for ${storagePath}: ${remoteError.message}`);
+                console.warn(`[Storage] Google Drive preview unavailable; serving local copy for ${storagePath}: ${remoteError.message}`);
                 return LocalStorage.createReadStream(storagePath);
             }
             throw remoteError;
@@ -556,8 +559,7 @@ const RcloneStorage = {
                 storagePath: storagePath 
             });
 
-            // Alist's filesystem API supports writes reliably for this
-            // WebDAV-backed Terabox storage; rclone rcat returns HTTP 405.
+            // For Google Drive via rclone, use rcat for streaming upload
             const parentFolderPath = storagePath.substring(0, storagePath.lastIndexOf('/'));
             if (!createdDirsCache.has(parentFolderPath)) {
                 try {
@@ -572,20 +574,28 @@ const RcloneStorage = {
                     }
                 }
             }
-            const token = await getAlistToken();
-            const putResponse = await fetch(`${alistDomain}/api/fs/put`, {
-                method: 'PUT',
-                headers: {
-                    'Authorization': token,
-                    'File-Path': encodeURIComponent(alistPath(storagePath))
-                },
-                body: fileBuffer,
-                signal: AbortSignal.timeout(10 * 60 * 1000)
+            
+            // Upload using rclone rcat (streaming)
+            const remotePath = `${PRIMARY_REMOTE}:${storagePath}`;
+            await new Promise((resolve, reject) => {
+                const child = spawn(rclonePath, ['rcat', remotePath], {
+                    env: { ...process.env, RCLONE_CONFIG: rcloneConfig.configPath }
+                });
+                
+                let stdErr = '';
+                child.stderr.on('data', (chunk) => { stdErr += chunk.toString(); });
+                child.on('error', (err) => reject(err));
+                child.on('close', (code) => {
+                    if (code !== 0) {
+                        reject(new Error(`rclone rcat failed: ${stdErr}`));
+                    } else {
+                        resolve();
+                    }
+                });
+                
+                child.stdin.write(fileBuffer);
+                child.stdin.end();
             });
-            const putData = await readAlistResponse(putResponse, 'mengupload file');
-            if (!putResponse.ok || putData.code !== 200) {
-                throw new Error(`Alist API upload failed: ${putData.message || `HTTP ${putResponse.status}`}`);
-            }
 
             logOperation('uploadDirect', { 
                 status: '✅ Upload successful',
@@ -620,8 +630,7 @@ const RcloneStorage = {
                 storagePath: storagePath 
             });
 
-            // Keep directory creation through rclone, but upload the file through
-            // Alist's filesystem API because WebDAV rcat is not supported.
+            // Create directory and upload through rclone to Google Drive
             const parentFolderPath = storagePath.substring(0, storagePath.lastIndexOf('/'));
 
             if (!createdDirsCache.has(parentFolderPath)) {
@@ -644,25 +653,33 @@ const RcloneStorage = {
                 }
             }
 
-            const token = await getAlistToken();
             logOperation('uploadMedia', { 
                 action: 'Uploading file',
                 filename: originalName,
                 category: category
             });
-            const putResponse = await fetch(`${alistDomain}/api/fs/put`, {
-                method: 'PUT',
-                headers: {
-                    'Authorization': token,
-                    'File-Path': encodeURIComponent(alistPath(storagePath))
-                },
-                body: fileBuffer,
-                signal: AbortSignal.timeout(10 * 60 * 1000)
+            
+            // Upload using rclone rcat to Google Drive
+            const remotePath = `${PRIMARY_REMOTE}:${storagePath}`;
+            await new Promise((resolve, reject) => {
+                const child = spawn(rclonePath, ['rcat', remotePath], {
+                    env: { ...process.env, RCLONE_CONFIG: rcloneConfig.configPath }
+                });
+                
+                let stdErr = '';
+                child.stderr.on('data', (chunk) => { stdErr += chunk.toString(); });
+                child.on('error', (err) => reject(err));
+                child.on('close', (code) => {
+                    if (code !== 0) {
+                        reject(new Error(`rclone rcat failed: ${stdErr}`));
+                    } else {
+                        resolve();
+                    }
+                });
+                
+                child.stdin.write(fileBuffer);
+                child.stdin.end();
             });
-            const putData = await readAlistResponse(putResponse, 'mengupload media');
-            if (!putResponse.ok || putData.code !== 200) {
-                throw new Error(`Alist API upload failed: ${putData.message || `HTTP ${putResponse.status}`}`);
-            }
 
             logOperation('uploadMedia', { 
                 status: '✅ Media upload successful',

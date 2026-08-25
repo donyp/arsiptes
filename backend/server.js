@@ -16,7 +16,7 @@ const LocalStorage = require('./local_storage');
 const { initializeClient: initializeSecretManager, getSecret } = require('./secretManager');
 const { initializeAlist } = require('./alistStartupHandler');
 const { initializeRcloneConnectivity, verifyRcloneConnectivity } = require('./rcloneConnectivityHandler');
-const { runBackendInitialization, getTeraboxHybridHandler } = require('./backendInitializer');
+const { runBackendInitialization } = require('./backendInitializer');
 
 // Load environment variables FIRST (before using them)
 // In local development: loads from .env file
@@ -92,23 +92,19 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ============================================================
-// Storage Health Check Endpoint (Terabox via Hybrid Handler)
+// Storage Health Check Endpoint (Google Drive via Rclone)
 // ============================================================
 app.get('/api/health/storage', async (req, res) => {
     try {
-        console.log('[STORAGE-HEALTH] Checking Terabox storage status...');
+        console.log('[STORAGE-HEALTH] Checking Google Drive storage status...');
         
         // Return simplified status
         res.json({
             healthy: true,
-            method: 'terabox-configured',
-            message: 'Terabox credentials configured (email/password)',
+            method: 'google-drive-configured',
+            message: 'Google Drive configured via Rclone',
             status: 'ready-for-deployment',
-            credentials: {
-                email: process.env.TERABOX_EMAIL ? '✓ Set' : '✗ Not set',
-                password: process.env.TERABOX_PASSWORD ? '✓ Set' : '✗ Not set',
-                appKey: process.env.TERABOX_APP_KEY || 'default'
-            },
+            storage: 'Google Drive',
             timestamp: new Date().toISOString()
         });
         
@@ -227,7 +223,7 @@ app.get('/api/preview/:filePath(*)', async (req, res) => {
 });
 
 // ============================================================
-// File Download Endpoint - Download file from Terabox
+// File Download Endpoint - Download file from Google Drive
 // ============================================================
 app.get('/api/download/:filePath(*)', async (req, res) => {
     try {
@@ -235,10 +231,10 @@ app.get('/api/download/:filePath(*)', async (req, res) => {
         
         console.log('[DOWNLOAD] Request for:', filePath);
         
-        // Get hybrid handler from backendInitializer
-        const handler = getTeraboxHybridHandler();
+        // Get rclone remote for Google Drive
+        const rcloneRemote = process.env.RCLONE_REMOTE || 'gdrive';
         
-        if (!handler) {
+        if (!rcloneRemote) {
             return res.status(503).json({
                 error: 'Storage handler not initialized'
             });
@@ -271,7 +267,7 @@ app.get('/api/download/:filePath(*)', async (req, res) => {
 // REMOVED: Old Terabox file listing endpoint
 // REASON: Endpoint conflicts with /api/files (database endpoint)
 // NOTE: Files are now loaded from database via /api/files
-// The database contains file metadata already synced from Terabox
+// Files are now loaded from database via /api/files
 // ============================================================
 // Old endpoint removed - use /api/files instead
 
@@ -1028,16 +1024,16 @@ app.get('/api/files/:id/view', authenticateToken, async (req, res) => {
                 console.log('[Preview] ✓ Using cached file');
                 fileStream = fs.createReadStream(cacheFilePath);
             } else {
-                console.log('[Preview] File not in cache, trying to download from Terabox...');
+                console.log('[Preview] File not in cache, trying to download from Google Drive...');
                 
-                // Try to download from Terabox using rclone
+                // Try to download from Google Drive using rclone
                 const { spawn } = require('child_process');
                 
-                // Download from terabox remote
+                // Download from gdrive remote
                 const rclonePath = file.storage_path.replace(/^\/arsip/, '');
-                const remotePath = `terabox:${rclonePath}`;
+                const remotePath = `gdrive:${rclonePath}`;
                 
-                console.log('[Preview] Downloading from Terabox:', remotePath);
+                console.log('[Preview] Downloading from Google Drive:', remotePath);
                 
                 // Use rclone to download
                 await new Promise((resolve, reject) => {
@@ -1056,7 +1052,7 @@ app.get('/api/files/:id/view', authenticateToken, async (req, res) => {
                     
                     rclone.on('close', (code) => {
                         if (code === 0) {
-                            console.log('[Preview] ✓ Downloaded from Terabox');
+                            console.log('[Preview] ✓ Downloaded from Google Drive');
                             resolve();
                         } else {
                             console.error('[Preview] Rclone failed:', stderr);
@@ -1224,7 +1220,7 @@ app.get('/api/share/:token', async (req, res) => {
         try {
             fileStream = await RcloneStorage.getStream(file.storage_path);
         } catch (downloadErr) {
-            console.error(`[Alist Stream Error] Path: ${file.storage_path}`, downloadErr);
+            console.error(`[Storage Stream Error] Path: ${file.storage_path}`, downloadErr);
             return res.status(500).json({ error: 'Gagal mendownload file.' });
         }
 
@@ -1486,8 +1482,8 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
         const fileBuffer = Buffer.from(req.file.buffer);
         
         // Primary: Upload to Local Storage before creating the DB record.
-        // This guarantees preview remains available even if Terabox rejects
-        // the background sync (for example while a CAPTCHA is required).
+        // This guarantees preview remains available even if Google Drive rejects
+        // the background sync.
         try {
             await LocalStorage.uploadDirect(fileBuffer, req.file.originalname, storagePath);
             console.log(`[Upload] Local storage upload complete for: ${req.file.originalname}`);
@@ -1496,7 +1492,7 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
             throw new Error(`Penyimpanan lokal gagal: ${localErr.message}`);
         }
         
-        // Secondary: Try Rclone/Terabox for backup (fire and forget).
+        // Secondary: Try Rclone/Google Drive for backup (fire and forget).
         // Sync metadata is intentionally not written to `files`: the deployed
         // schema does not include optional sync-status columns.
         RcloneStorage.uploadInBackground(
@@ -2132,10 +2128,10 @@ app.get('/api/system/maintenance', async (req, res) => {
     }
 });
 
-// POST /api/system/sync-terabox — Sync Terabox files to database
-app.post('/api/system/sync-terabox', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
+// POST /api/system/sync-gdrive — Sync Google Drive files to database
+app.post('/api/system/sync-gdrive', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
     try {
-        console.log('[Sync] Starting Terabox to Database sync...');
+        console.log('[Sync] Starting Google Drive to Database sync...');
         const { data: zones, error: zonesError } = await supabase.from('zonas').select('id, kode');
         if (zonesError) throw zonesError;
         const { data: tokos, error: tokosError } = await supabase.from('toko').select('id, kode, zona_id');
@@ -2225,7 +2221,7 @@ app.post('/api/system/sync-terabox', authenticateToken, authorizeRole('super_adm
             existingPaths.add(storagePath);
         }
 
-        // File yang benar-benar masih ada di Terabox harus tampil di dashboard.
+        // File yang benar-benar masih ada di Google Drive harus tampil di dashboard.
         // Restore dalam batch agar file lama yang tersoft-delete tidak hilang.
         for (let i = 0; i < pathsToRestore.length; i += 100) {
             const batch = pathsToRestore.slice(i, i + 100);
@@ -2252,7 +2248,7 @@ app.post('/api/system/sync-terabox', authenticateToken, authorizeRole('super_adm
         // Audit log
         await supabase.from('audit_logs').insert({
             user_id: req.user.userId,
-            action: 'Sync Terabox to Database',
+            action: 'Sync Google Drive to Database',
             context: JSON.stringify({
                 totalFilesFound: files.length,
                 totalFilesImported,
@@ -2371,7 +2367,7 @@ app.get('/api/system/health', authenticateToken, authorizeRole('super_admin', 'm
     }
     try {
         const status = await verifyRcloneConnectivity();
-        services.alist = { healthy: Boolean(status.verified), detail: status.message || status.errorDetails || 'Alist/Terabox' };
+        services.alist = { healthy: Boolean(status.verified), detail: status.message || status.errorDetails || 'Google Drive' };
     } catch (err) {
         services.alist = { healthy: false, detail: err.message };
     }
@@ -2580,11 +2576,11 @@ app.get('/api/debug/fix-sizes', async (req, res) => {
     }
 });
 
-// GET /api/stats/alist — live file count from Terabox via rclone (cached 5 min per scope)
+// GET /api/stats/gdrive — live file count from Google Drive via rclone (cached 5 min per scope)
 const { execFile } = require('child_process');
 const RCLONE_BIN   = process.env.RCLONE_BIN    || require('path').resolve(__dirname, '..', 'rclone');
-const RCLONE_CONF  = process.env.RCLONE_CONFIG  || require('path').resolve(__dirname, '..', 'rclone.conf');
-const ALIST_REMOTE = process.env.RCLONE_ALIST_REMOTE || 'terabox';
+const RCLONE_CONF  = process.env.RCLONE_CONFIG_PATH  || require('path').resolve(__dirname, '..', 'rclone.conf');
+const ALIST_REMOTE = process.env.RCLONE_REMOTE || 'gdrive';
 const ALIST_BASE   = process.env.RCLONE_BASE_PATH    || '/arsip';
 
 // Cache per scope-path: { [path]: { data, at } }
@@ -2697,7 +2693,7 @@ app.get('/api/stats/storage', authenticateToken, async (req, res) => {
         res.json({
             total_bytes: totalUsed,
             today_bytes: todayUsed,
-            limit_bytes: 1024 * 1024 * 1024 * 1024 // 1024 GB (Terabox Default)
+            limit_bytes: 1024 * 1024 * 1024 * 80 // 80 GB (Google Drive)
         });
     } catch (err) {
         console.error('Storage Stats Error:', err);
@@ -3189,7 +3185,7 @@ app.post('/api/media-categories', authenticateToken, requirePermission('manage_m
             throw error;
         }
 
-        // Create folder in Terabox via Rclone
+        // Create folder in Google Drive via Rclone
         try {
             await RcloneStorage.createMediaFolder(slug);
         } catch (folderErr) {
@@ -4195,7 +4191,7 @@ const HOST = '0.0.0.0';
 (async () => {
     try {
         // ================================================================
-        // Run complete backend initialization (includes Terabox setup)
+        // Run complete backend initialization (includes Google Drive setup)
         // ================================================================
         const initResult = await runBackendInitialization();
         
@@ -4222,7 +4218,7 @@ const HOST = '0.0.0.0';
             console.log(`✅ External access: http://localhost:${PORT}`);
             console.log(`🚀 Pusat Arsip Anka Backend v2.1 running on http://localhost:${PORT}`);
             console.log(`   Auth: JWT (${JWT_EXPIRES_IN} expiry)`);
-            console.log(`   Storage: Terabox (Direct API + WebDAV Hybrid)`);
+            console.log(`   Storage: Google Drive (via Rclone)`);
             console.log(`   DB: Supabase PostgreSQL`);
             console.log(`   Alist: WebDAV on http://localhost:5244`);
             console.log('================================================\n');

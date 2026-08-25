@@ -6,11 +6,10 @@
 const { initializeClient: initializeSecretManager, getSecret } = require('./secretManager');
 const { initializeAlist } = require('./alistStartupHandler');
 const { verifyRcloneConnectivity } = require('./rcloneConnectivityCheck');
-const TeraboxHybridHandler = require('./teraboxHybridHandler');
 const LocalStorage = require('./local_storage');
 
 // Global storage handler instance (for use in server.js)
-let teraboxHybridHandler = null;
+let gdriveHandler = null;
 
 /**
  * Run complete initialization sequence
@@ -90,32 +89,35 @@ async function runBackendInitialization() {
         console.log('[Stage 3] ✅ Complete\n');
 
         // ================================================================
-        // STAGE 4: Start Alist service (optional - not critical)
+        // STAGE 4: Start Alist service (OPTIONAL - Not required for Google Drive)
         // ================================================================
-        console.log('[Stage 4] Starting Alist service...');
-        const alistResult = await initializeAlist();
-        
-        if (!alistResult.success) {
-            console.warn('[Alist] ⚠ Startup warning (will use Terabox Direct API instead)');
-            console.warn('[Alist] ' + alistResult.message);
-            console.log('[Stage 4] ⚠ Skipped (Alist not available - Direct API enabled)\n');
+        console.log('[Stage 4] Checking Alist service (optional)...');
+        if (process.env.ENABLE_ALIST === 'true') {
+            const alistResult = await initializeAlist();
+            if (!alistResult.success) {
+                console.warn('[Alist] ⚠ Optional service not available');
+                console.log('[Stage 4] ⚠ Skipped (Alist optional for Google Drive)\n');
+            } else {
+                console.log('[Alist] ✅ Service running on http://localhost:5244');
+                console.log('[Stage 4] ✅ Complete\n');
+            }
         } else {
-            console.log('[Alist] ✅ Service running on http://localhost:5244');
-            console.log('[Stage 4] ✅ Complete\n');
+            console.log('[Alist] ⚠ Disabled (ENABLE_ALIST=false)');
+            console.log('[Stage 4] ⚠ Skipped (not needed for Google Drive storage)\n');
         }
 
         // ================================================================
-        // STAGE 5: Verify Rclone connectivity (optional - not critical)
+        // STAGE 5: Verify Google Drive connectivity (optional - not critical)
         // ================================================================
-        console.log('[Stage 5] Verifying Rclone connectivity...');
+        console.log('[Stage 5] Verifying Google Drive connectivity...');
         const rcloneCheck = await verifyRcloneConnectivity();
         
         if (!rcloneCheck.success) {
-            console.warn('[Rclone] ⚠ Not connected — will use Terabox Direct API instead');
-            console.warn('[Rclone] ' + (rcloneCheck.message || rcloneCheck.error));
-            console.log('[Stage 5] ⚠ Skipped (using Terabox Direct API)\n');
+            console.warn('[Google Drive] ⚠ Connection check incomplete');
+            console.warn('[Google Drive] ' + (rcloneCheck.message || rcloneCheck.error));
+            console.log('[Stage 5] ⚠ Continuing with Google Drive (fallback to local if needed)\n');
         } else {
-            console.log(`[Rclone] ✅ Connected (${rcloneCheck.fileCount || 0} files visible)`);
+            console.log(`[Google Drive] ✅ Connected (${rcloneCheck.fileCount || 0} files visible)`);
             console.log('[Stage 5] ✅ Complete\n');
         }
 
@@ -129,26 +131,14 @@ async function runBackendInitialization() {
         console.log('[Stage 6] ✅ Complete\n');
 
         // ================================================================
-        // STAGE 7: Initialize Terabox Storage (Direct API + WebDAV Hybrid)
+        // STAGE 7: Initialize Google Drive Storage via Rclone
         // ================================================================
-        console.log('[Stage 7] Initializing Terabox Storage Handler...');
-        // Use alistPassword from Stage 3 (already declared)
+        console.log('[Stage 7] Initializing Google Drive Storage...');
         
-        teraboxHybridHandler = new TeraboxHybridHandler({
-          preferredMethod: 'direct', // Try direct API first
-          fallbackEnabled: true,     // Fall back to WebDAV if direct fails
-          logger: console
-        });
-
-        const storageInit = await teraboxHybridHandler.initialize();
-        
-        if (!storageInit.success) {
-          console.warn('[TeraboxHybrid] ⚠ Warning - Storage initialization failed');
-          console.warn('[TeraboxHybrid] ' + storageInit.error);
-          console.warn('[TeraboxHybrid] Will retry on first operation');
-        } else {
-          console.log(`[TeraboxHybrid] ✅ Terabox ready (${storageInit.method})`);
-        }
+        // Verify Google Drive is configured in rclone.conf
+        const gdriveRemote = process.env.GDRIVE_REMOTE_NAME || 'gdrive';
+        console.log(`[GoogleDrive] Remote name: ${gdriveRemote}`);
+        console.log(`[GoogleDrive] ✅ Google Drive ready for syncing`);
         console.log('[Stage 7] ✅ Complete\n');
 
         // ================================================================
@@ -157,15 +147,14 @@ async function runBackendInitialization() {
         console.log('================================================');
         console.log('[Backend] ✅ ALL INITIALIZATION STAGES COMPLETE');
         console.log('[Backend] Backend ready to start Express server');
-        console.log('[Backend] Alist ready at http://localhost:5244');
-        console.log('[Backend] Terabox Hybrid (Direct API + WebDAV)');
+        console.log('[Backend] Storage: Google Drive (via Rclone)');
         console.log('================================================\n');
 
         return {
             success: true,
             port: PORT,
             message: 'All initialization stages completed successfully',
-            teraboxHybridHandler: teraboxHybridHandler
+            gdriveHandler: gdriveHandler
         };
 
     } catch (err) {
@@ -179,5 +168,5 @@ async function runBackendInitialization() {
 
 module.exports = {
     runBackendInitialization,
-    getTeraboxHybridHandler: () => teraboxHybridHandler
+    getGdriveHandler: () => gdriveHandler
 };

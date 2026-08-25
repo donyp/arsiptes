@@ -1,14 +1,14 @@
 // ============================================================
-// Rclone Connectivity Verification - Task 2.2
-// Verifies Rclone can connect to Alist WebDAV endpoint
+// Rclone Connectivity Verification - Updated for Google Drive
+// Verifies Rclone can connect to Google Drive
 // ============================================================
 
 const { execFile } = require('child_process');
 const path = require('path');
 
 /**
- * Check if Rclone can successfully connect to Alist WebDAV endpoint
- * Executes: rclone --config rclone.conf lsjson terabox:/
+ * Check if Rclone can successfully connect to Google Drive
+ * Executes: rclone --config rclone.conf lsjson gdrive:/
  * 
  * Returns:
  * - On success: { success: true, message: "..." }
@@ -18,18 +18,18 @@ async function verifyRcloneConnectivity(rcloneConfigPath = null) {
     // Default rclone.conf location
     const configPath = rcloneConfigPath || path.join(__dirname, '..', 'rclone.conf');
     
-    console.log('[Rclone] Verifying connectivity to Alist WebDAV endpoint...');
+    console.log('[Rclone] Verifying connectivity to Google Drive...');
     console.log(`[Rclone] Config: ${configPath}`);
 
     return new Promise((resolve) => {
         const timeout = 15000; // 15 second timeout
         let timedOut = false;
 
-        // Execute: rclone --config <path> lsjson terabox:/
+        // Execute: rclone --config <path> lsjson gdrive:/
         const child = execFile('rclone', [
             '--config', configPath,
             'lsjson',
-            'terabox:/'
+            'gdrive:/'
         ], {
             timeout,
             maxBuffer: 1024 * 1024 // 1MB buffer for output
@@ -42,10 +42,10 @@ async function verifyRcloneConnectivity(rcloneConfigPath = null) {
                     const parsed = JSON.parse(stdout);
                     // Should be an array (even if empty)
                     if (Array.isArray(parsed)) {
-                        console.log('[Rclone] ✅ WebDAV connection verified');
+                        console.log('[Rclone] ✅ Google Drive connection verified');
                         return resolve({
                             success: true,
-                            message: 'Rclone successfully connected to Alist WebDAV endpoint',
+                            message: 'Rclone successfully connected to Google Drive',
                             fileCount: parsed.length
                         });
                     } else {
@@ -71,30 +71,25 @@ async function verifyRcloneConnectivity(rcloneConfigPath = null) {
             // Auth failure
             if (stderrStr.includes('401') || stderrStr.includes('Unauthorized')) {
                 classification = 'AUTH_FAILED';
-                diagnostic = 'Check rclone.conf credentials match Alist admin account';
+                diagnostic = 'Check rclone.conf [gdrive] token is valid. Refresh using: rclone authorize drive gdrive';
             }
-            // Gzip error (Alist responding with wrong protocol)
-            else if (stderrStr.includes('gzip: invalid header')) {
-                classification = 'ALIST_PROTOCOL_ERROR';
-                diagnostic = 'Alist WebDAV endpoint not responding correctly. Verify Alist is running and config.json has correct mount path';
-            }
-            // Connection refused (Alist not running)
+            // Connection refused
             else if (stderrStr.includes('Connection refused') || stderrStr.includes('ECONNREFUSED')) {
-                classification = 'ALIST_UNREACHABLE';
-                diagnostic = 'Cannot reach Alist on localhost:5244. Verify Alist service is running';
+                classification = 'UNREACHABLE';
+                diagnostic = 'Cannot reach Google Drive. Check internet connection';
             }
             // Timeout
             else if (errorStr.includes('ETIMEDOUT') || timedOut) {
                 classification = 'TIMEOUT';
-                diagnostic = `Rclone connection timeout after ${timeout}ms`;
+                diagnostic = `Rclone connection timeout after ${timeout}ms. Check internet connection`;
             }
             // Bad remote name
-            else if (stderrStr.includes('didn\'t find remote') || stderrStr.includes('Unknown remote')) {
+            else if (stderrStr.includes('didn\'t find') || stderrStr.includes('Unknown remote') || stderrStr.includes('not found section')) {
                 classification = 'BAD_REMOTE';
-                diagnostic = 'Remote "terabox" not configured in rclone.conf. Check [terabox] section exists';
+                diagnostic = 'Remote "gdrive" not configured in rclone.conf. Check [gdrive] section exists';
             }
             // File not found / config error
-            else if (stderrStr.includes('not found') || stderrStr.includes('Config')) {
+            else if (stderrStr.includes('Config')) {
                 classification = 'CONFIG_ERROR';
                 diagnostic = `Rclone config error: ${stderrStr.substring(0, 100)}`;
             }
