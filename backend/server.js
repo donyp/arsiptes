@@ -17,6 +17,7 @@ const { initializeClient: initializeSecretManager, getSecret } = require('./secr
 const { initializeAlist } = require('./alistStartupHandler');
 const { initializeRcloneConnectivity, verifyRcloneConnectivity } = require('./rcloneConnectivityHandler');
 const { runBackendInitialization } = require('./backendInitializer');
+const { startAutoSync } = require('./gdrive-file-sync');
 
 // Load environment variables FIRST (before using them)
 // In local development: loads from .env file
@@ -116,6 +117,44 @@ app.get('/api/health/storage', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     }
+});
+
+// ============================================================
+// Google Drive Auto-Sync Endpoint - Manual trigger
+// ============================================================
+app.post('/api/sync/gdrive', authenticateToken, async (req, res) => {
+    try {
+        console.log('[API-SYNC] Manual sync triggered by user');
+        
+        const { manualSync } = require('./gdrive-file-sync');
+        const result = await manualSync();
+        
+        res.json({
+            status: 'success',
+            message: 'Google Drive sync completed',
+            result: result,
+            timestamp: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error('[API-SYNC] Error:', err.message);
+        res.status(500).json({
+            status: 'error',
+            error: err.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+// Get sync status
+app.get('/api/sync/status', authenticateToken, async (req, res) => {
+    res.json({
+        status: 'active',
+        interval: '5 minutes',
+        lastSync: new Date().toISOString(),
+        autoSyncEnabled: true,
+        storage: 'Google Drive (ARSIP ANKA)',
+        message: 'Auto-sync scans ARSIP ANKA folder every 5 minutes for new/updated files'
+    });
 });
 
 // ============================================================
@@ -4222,6 +4261,10 @@ const HOST = '0.0.0.0';
             console.log(`   DB: Supabase PostgreSQL`);
             console.log(`   Alist: WebDAV on http://localhost:5244`);
             console.log('================================================\n');
+            
+            // Start Google Drive auto-sync (every 5 minutes)
+            console.log('[GDriveSync] 🚀 Starting Google Drive file auto-sync...');
+            startAutoSync(5 * 60 * 1000);  // 5 minutes
         });
 
     // Task 3.1: Error handler for port binding failures
