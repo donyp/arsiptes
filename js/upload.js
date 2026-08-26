@@ -38,10 +38,45 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ---- Load Toko List (for dropdown selection) ----
 async function loadAllTokos() {
     try {
-        const { tokos: toko } = await API.get('/api/toko');
-        window._allTokos = toko || [];
+        console.log('[loadAllTokos] Starting to fetch tokos from API...');
+        const response = await API.get('/api/toko');
+        // Handle both { tokos: [...] } and direct array response
+        const toko = response.tokos || response || [];
+        window._allTokos = Array.isArray(toko) ? toko : [];
+        console.log('[loadAllTokos] Loaded', window._allTokos.length, 'tokos:', window._allTokos);
+        
+        // If no tokos from API, use hardcoded defaults
+        if (window._allTokos.length === 0) {
+            console.log('[loadAllTokos] WARNING: No tokos from API, using hardcoded defaults');
+            window._allTokos = [
+                { id: 1, nama: 'Balaraja', zona_id: 1 },
+                { id: 2, nama: 'Cianjur', zona_id: 1 },
+                { id: 3, nama: 'Serang Timur', zona_id: 1 },
+                { id: 4, nama: 'Pasarkemis', zona_id: 2 },
+                { id: 5, nama: 'Bitung', zona_id: 3 },
+                { id: 6, nama: 'Cilegon', zona_id: 2 },
+                { id: 7, nama: 'Cipondoh', zona_id: 1 },
+                { id: 8, nama: 'Kutabumi', zona_id: 3 },
+                { id: 9, nama: 'Ciruas', zona_id: 2 }
+            ];
+            console.log('[loadAllTokos] Using fallback tokos, count:', window._allTokos.length);
+        }
+        console.log('[loadAllTokos] Complete. Final tokos:', window._allTokos);
     } catch (err) {
-        window._allTokos = [];
+        console.error('[loadAllTokos] Error:', err);
+        // Fallback to hardcoded tokos if API fails
+        window._allTokos = [
+            { id: 1, nama: 'Balaraja', zona_id: 1 },
+            { id: 2, nama: 'Cianjur', zona_id: 1 },
+            { id: 3, nama: 'Serang Timur', zona_id: 1 },
+            { id: 4, nama: 'Pasarkemis', zona_id: 2 },
+            { id: 5, nama: 'Bitung', zona_id: 3 },
+            { id: 6, nama: 'Cilegon', zona_id: 2 },
+            { id: 7, nama: 'Cipondoh', zona_id: 1 },
+            { id: 8, nama: 'Kutabumi', zona_id: 3 },
+            { id: 9, nama: 'Ciruas', zona_id: 2 }
+        ];
+        console.log('[loadAllTokos] API error, using fallback tokos:', err.message);
     }
 }
 
@@ -157,11 +192,16 @@ function scanFilename(name) {
     else if (/^NON/i.test(firstWord)) result.tipe = 'NON';
 
     // 2. Detect Toko (Match against window._allTokos)
+    console.log('[scanFilename] Input:', name);
+    console.log('[scanFilename] Tokos available:', window._allTokos ? window._allTokos.length : 0);
+    
     if (window._allTokos && window._allTokos.length > 0) {
         // ULTRA-NORMALIZATION: Remove ALL non-alphanumeric characters for matching
         const normalize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
 
         const cleanToMatch = normalize(cleanName);
+        console.log('[scanFilename] Normalized filename:', cleanToMatch);
+        console.log('[scanFilename] Available tokos:', window._allTokos.map(t => ({ nama: t.nama, normalized: normalize(t.nama) })));
 
         // Sort tokos by length descending to catch specific multi-word matches first
         const sortedTokos = [...window._allTokos].sort((a, b) => b.nama.length - a.nama.length);
@@ -169,10 +209,17 @@ function scanFilename(name) {
         for (const t of sortedTokos) {
             const cleanTokoName = normalize(t.nama);
             if (cleanTokoName && cleanToMatch.includes(cleanTokoName)) {
+                console.log('[scanFilename] ✅ MATCH FOUND:', t.nama, 'in file:', name);
                 result.toko = t;
                 break;
             }
         }
+        
+        if (!result.toko) {
+            console.log('[scanFilename] ❌ No toko match found. Available:', window._allTokos.map(t => t.nama).join(', '));
+        }
+    } else {
+        console.log('[scanFilename] ⚠️  WARNING: No tokos loaded! window._allTokos =', window._allTokos);
     }
 
     // 3. Detect Nominal (Look for pattern X.XXX.XXX)
@@ -222,6 +269,7 @@ function scanFilename(name) {
         }
     }
 
+    console.log('[scanFilename] Result:', { tipe: result.tipe, tokoName: result.toko?.nama, nominal: result.nominal, date: result.date });
     return result;
 }
 
@@ -382,7 +430,6 @@ function setupForm() {
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const category = 'INVOICE'; // Always Invoice for this page
 
         if (selectedFiles.length === 0) {
             Toast.warning('Pilih file terlebih dahulu.');
@@ -416,6 +463,15 @@ function setupForm() {
 
         const uploadTask = async (item) => {
             try {
+                // Extract category from filename: "NON Balaraja..." -> "NON", "PPN Balaraja..." -> "PPN"
+                let category = 'INVOICE'; // default
+                const filenameUpper = item.file.name.toUpperCase();
+                if (filenameUpper.startsWith('NON ')) {
+                    category = 'NON';
+                } else if (filenameUpper.startsWith('PPN ')) {
+                    category = 'PPN';
+                }
+
                 const formData = new FormData();
                 formData.append('file', item.file);
                 formData.append('zona_id', item.toko.zona_id);

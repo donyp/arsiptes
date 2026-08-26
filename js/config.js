@@ -4,8 +4,9 @@
 
 const CONFIG = {
     // Backend API URL
-    // Backend API URL (Empty string means relative to current origin)
-    API_URL: '',
+    // Use http://localhost:5000 for development (local)
+    // Empty string uses relative URLs (same domain)
+    API_URL: 'http://localhost:5000',
 
     // App Constants
     CATEGORIES: [

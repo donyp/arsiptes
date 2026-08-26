@@ -18,9 +18,14 @@ function ensureDir(dirPath) {
 
 // Convert storage path to local file path
 function getLocalPath(storagePath) {
-    // storagePath format: /arsip/zona-12/TOKO-TASIKMALAYA/INVOICE/filename.pdf
-    // Convert to: ./local_files/zona-12/TOKO-TASIKMALAYA/INVOICE/filename.pdf
-    const relativePath = storagePath.replace(/^\/arsip\//, '');
+    // storagePath format: /ARSIP ANKA/zona-1/toko-balaraja/INVOICE/NON/filename.pdf
+    // Convert to: ./local_files/zona-1/toko-balaraja/INVOICE/NON/filename.pdf
+    // Remove leading slash and base path prefix
+    let relativePath = storagePath.startsWith('/') ? storagePath.substring(1) : storagePath;
+    // Remove '/ARSIP ANKA/' prefix (handles both spaces and escaped versions)
+    relativePath = relativePath.replace(/^ARSIP\s+ANKA\//, '');
+    // Fallback: if still has old /arsip/ prefix, remove it (for backward compatibility)
+    relativePath = relativePath.replace(/^arsip\//, '');
     return path.join(LOCAL_STORAGE_PATH, relativePath);
 }
 
@@ -31,14 +36,14 @@ function createMockFiles() {
     // Create files for ALL zones (1-20 based on database)
     const zones = [];
     // Add specific zones
-    zones.push('zona-1', 'zona-2', 'zona-3A', 'zona-3B', 'zona-4', 'zona-5', 'zona-6A', 'zona-6B');
+    zones.push('zona-1', 'zona-2', 'zona-3a', 'zona-3b', 'zona-4', 'zona-5', 'zona-6a', 'zona-6b');
     zones.push('zona-7', 'zona-8', 'zona-9', 'zona-10', 'zona-11', 'zona-12', 'zona-13', 'zona-14', 'zona-15', 'zona-16', 'zona-17', 'zona-99');
     
     const tokos = [
-        'TOKO-TASIKMALAYA', 'TOKO-CIANJUR', 'TOKO-BANDUNG', 'TOKO-JAKARTA',
-        'TOKO-SURABAYA', 'TOKO-MEDAN', 'TOKO-YOGYAKARTA', 'TOKO-MAKASSAR'
+        'toko-balaraja', 'toko-cianjur', 'toko-serang-timur', 'toko-pasarkemis',
+        'toko-bitung', 'toko-cilegon', 'toko-cipondoh', 'toko-kutabumi'
     ];
-    const categories = ['INVOICE', 'PPN', 'NON_PPN', 'PIUTANG'];
+    const categories = ['INVOICE', 'INVOICE/NON', 'INVOICE/PPN', 'BUKTI PIUTANG'];
     
     zones.forEach(zona => {
         tokos.forEach(toko => {
@@ -48,7 +53,7 @@ function createMockFiles() {
                 
                 // Create 2 sample PDF files per location
                 for (let i = 1; i <= 2; i++) {
-                    const fileName = `Sample_${category}_${i}.pdf`;
+                    const fileName = `Sample_${category.replace(/\//g, '_')}_${i}.pdf`;
                     const filePath = path.join(dirPath, fileName);
                     
                     if (!fs.existsSync(filePath)) {
@@ -116,11 +121,12 @@ module.exports = {
                 console.log(`[LocalStorage] Serving sample file as fallback...`);
                 
                 // Fallback: serve a sample file based on category from storage path
-                // Extract category from path: /arsip/zona-12/TOKO-TASIKMALAYA/INVOICE/filename.pdf
-                const pathMatch = storagePath.match(/\/arsip\/([^/]+)\/([^/]+)\/([^/]+)\//);
+                // Extract category from path: /ARSIP ANKA/zona-1/toko-balaraja/INVOICE/NON/filename.pdf
+                const pathMatch = storagePath.match(/\/zona-(\w+)\/([^/]+)\/([^/]+(?:\/[^/]+)?)\//);
                 if (pathMatch) {
-                    const [, zona, toko, category] = pathMatch;
-                    const sampleFile = path.join(LOCAL_STORAGE_PATH, zona, toko, category, `Sample_${category}_1.pdf`);
+                    const [, zonaNum, toko, category] = pathMatch;
+                    const zona = `zona-${zonaNum}`;
+                    const sampleFile = path.join(LOCAL_STORAGE_PATH, zona, toko, category, `Sample_${category.replace(/\//g, '_')}_1.pdf`);
                     
                     if (fs.existsSync(sampleFile)) {
                         console.log(`[LocalStorage] ✓ Serving sample: ${sampleFile}`);
@@ -129,7 +135,7 @@ module.exports = {
                 }
                 
                 // Final fallback: any sample file
-                const finalFallback = path.join(LOCAL_STORAGE_PATH, 'zona-1', 'TOKO-CIANJUR', 'INVOICE', 'Sample_INVOICE_1.pdf');
+                const finalFallback = path.join(LOCAL_STORAGE_PATH, 'zona-1', 'toko-balaraja', 'INVOICE', 'Sample_INVOICE_1.pdf');
                 if (fs.existsSync(finalFallback)) {
                     console.log(`[LocalStorage] ✓ Serving final fallback: ${finalFallback}`);
                     return fs.createReadStream(finalFallback);
@@ -178,8 +184,43 @@ module.exports = {
         }
     },
     
+    // Download file from local storage as buffer
+    async downloadBuffer(storagePath) {
+        try {
+            const localPath = getLocalPath(storagePath);
+            
+            if (!fs.existsSync(localPath)) {
+                throw new Error(`File not found: ${localPath}`);
+            }
+            
+            console.log(`[LocalStorage] Reading buffer: ${localPath}`);
+            return fs.readFileSync(localPath);
+        } catch (err) {
+            console.error('[LocalStorage] Download buffer error:', err.message);
+            throw err;
+        }
+    },
+    
     // Initialize mock files for testing
     initializeMockFiles() {
         createMockFiles();
+    },
+
+    // Delete file from local storage
+    deleteFile(storagePath) {
+        try {
+            const localPath = getLocalPath(storagePath);
+            if (fs.existsSync(localPath)) {
+                fs.unlinkSync(localPath);
+                console.log(`[LocalStorage] Deleted: ${localPath}`);
+                return true;
+            } else {
+                console.warn(`[LocalStorage] File not found to delete: ${localPath}`);
+                return false;
+            }
+        } catch (err) {
+            console.error('[LocalStorage] Delete error:', err.message);
+            throw err;
+        }
     }
 };

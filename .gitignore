@@ -26,7 +26,9 @@ Thumbs.db
 
 # Alist/Rclone data
 data/
-# rclone.conf is needed for production - don't ignore it!
+# rclone.conf contains sensitive credentials - don't commit!
+rclone.conf
+backend/rclone.conf
 
 # Sensitive runtime configuration and credentials
 rclone

@@ -47,7 +47,7 @@ async function syncTeraboxToDatabase() {
 
         // 3. Scan Terabox storage structure
         console.log('[3/4] Scanning Terabox storage...');
-        const baseStoragePath = '/arsip';
+        const baseStoragePath = '/ARSIP ANKA';
         
         let totalFilesFound = 0;
         let totalFilesImported = 0;

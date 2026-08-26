@@ -182,8 +182,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     // await loadBroadcast(); // Removed: now handled globally by sidebar.js
 
     await loadStorageStats();
-    // Chart is available to ALL roles — backend handles zone filtering
-    await loadAnalyticsChart();
 
     // Admin controls only for super admin
     if (hasPermission('view_dashboard_stats')) {
@@ -969,11 +967,7 @@ function renderTable() {
                                 <a href="${CONFIG.API_URL}/api/files/${a.id}/download?token=${API.getToken()}" class="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-md transition-colors" title="Download">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
                                 </a>
-                                ${isSuperAdmin() ? `
-                                    <button onclick="copyFileLink('${a.id}', this)" class="p-1.5 text-purple-600 hover:bg-purple-50 rounded-md transition-colors" title="Salin Link">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                                    </button>
-                                ` : ''}
+
                                 ${isSuperAdmin() || currentUser?.role === 'moderator' ? `
                                     <button onclick="deleteArchive('${a.id}', '${a.nama_file}')" class="p-1.5 text-red-600 hover:bg-red-50 rounded-md transition-colors" title="Hapus">
                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
@@ -995,11 +989,33 @@ function renderTable() {
 
                 <!-- Bottom Row: Metadata (Tanggal dokumen saja + spacing) -->
                 <div class="mt-2 pt-2 border-t border-gray-150"></div>
-                <div class="flex items-center gap-4 text-[11px] font-semibold text-gray-600 pl-10 py-1.5">
+                <div class="flex items-center gap-4 text-[12px] font-bold text-gray-700 pl-10 py-2">
                     <div class="flex items-center gap-0.5">
-                        <span class="text-gray-400">📁</span>
-                        <span>${getCategoryLabel(a.category)}${a.tipe_ppn ? ` • ${getTipePPNLabel(a.tipe_ppn)}` : ''}</span>
+                        <span class="text-gray-400 text-lg">📁</span>
+                        ${(() => {
+                            console.log('[Rendering Badge] File:', a.nama_file, 'Category:', a.category, 'Tipe_PPn:', a.tipe_ppn);
+                            const badges = getCategoryBadges(a.category, a.tipe_ppn);
+                            let display = '';
+                            if (badges.typeLabel) {
+                                display = `${badges.typeLabel} - ${badges.categoryLabel}`;
+                            } else {
+                                display = badges.categoryLabel;
+                            }
+                            console.log('[Rendering Badge Result]', display);
+                            return `<span class="font-bold text-gray-800">${display}</span>`;
+                        })()}
                     </div>
+                    ${a.total_jual ? `
+                    <div class="flex items-center gap-0.5">
+                        <span class="text-gray-400 text-lg">💰</span>
+                        <span class="font-mono text-gray-800 font-bold text-[13px]">Rp ${(a.total_jual || 0).toLocaleString('id-ID')}</span>
+                    </div>
+                    ` : extractNominalFromFilename(a.nama_file) ? `
+                    <div class="flex items-center gap-0.5">
+                        <span class="text-gray-400">💰</span>
+                        <span>${extractNominalFromFilename(a.nama_file)}</span>
+                    </div>
+                    ` : ''}
                     <div class="flex items-center gap-0.5">
                         <span class="text-gray-400">📍</span>
                         <span>${a.zonas?.nama || '-'}</span>
@@ -1008,12 +1024,6 @@ function renderTable() {
                         <span class="text-gray-400">📅</span>
                         <span>${docDate}</span>
                     </div>
-                    ${a.total_jual ? `
-                        <div class="flex items-center gap-0.5">
-                            <span class="text-gray-400">💰</span>
-                            <span class="font-mono text-gray-700">Rp ${(a.total_jual || 0).toLocaleString('id-ID')}</span>
-                        </div>
-                    ` : ''}
                     ${syncStatusBadge(a.storage_path) ? `
                         <div class="ml-auto">
                             ${syncStatusBadge(a.storage_path)}
@@ -1411,40 +1421,6 @@ function handlePreviewLoaded() {
     if (loading) loading.classList.add('hidden');
 }
 
-async function copyFileLink(fileId, btnEl) {
-    try {
-        acknowledgeFile(fileId);
-        const { token } = await API.post(`/api/files/${fileId}/share`);
-        const baseUrl = CONFIG.API_URL || window.location.origin;
-        const shortUrl = `${baseUrl}/api/share/${token}`;
-
-        // Try modern Clipboard API
-        try {
-            await navigator.clipboard.writeText(shortUrl);
-            Toast.success('Link Tautan berhasil disalin (Aktif 2 Hari)!');
-        } catch (clipErr) {
-            console.warn('Clipboard API failed, trying execCommand fallback:', clipErr);
-            // Fallback for non-HTTPS or sensitive browsers
-            const textArea = document.createElement("textarea");
-            textArea.value = shortUrl;
-            document.body.appendChild(textArea);
-            textArea.select();
-            document.execCommand("copy");
-            document.body.removeChild(textArea);
-            Toast.success('Link Tautan berhasil disalin!');
-        }
-
-        const originalHtml = btnEl.innerHTML;
-        btnEl.innerHTML = `<svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span class="text-emerald-400">Tersalin!</span>`;
-        setTimeout(() => {
-            btnEl.innerHTML = originalHtml;
-        }, 2000);
-    } catch (err) {
-        console.error('Copy Failed:', err);
-        Toast.error('Gagal menyalin link: ' + (err.message || 'Server error'));
-    }
-}
-
 
 async function sendBroadcast() {
     const input = document.getElementById('broadcast-input');
@@ -1532,21 +1508,17 @@ async function deleteBroadcast(id) {
 // ---- Storage Stats ----
 async function loadStorageStats() {
     try {
-        // Jalankan paralel: stats DB + stats Alist live
-        const [stats, alistStats] = await Promise.allSettled([
-            API.get('/api/stats/storage'),
-            API.get('/api/stats/alist')
-        ]);
+        // UPDATED: Google Drive storage only (no more Alist)
+        const stats = await API.get('/api/stats/storage');
 
-        // 1. Storage usage (dari DB)
-        if (stats.status === 'fulfilled') {
-            const { total_bytes, today_bytes, limit_bytes } = stats.value;
+        // 1. Storage usage (from database/Google Drive)
+        if (stats) {
+            const { total_bytes, today_bytes, limit_bytes } = stats;
             const storageEl = document.getElementById('stat-storage');
             const progressEl = document.getElementById('stat-storage-progress');
             if (storageEl) {
-                // Gunakan bytes dari Alist jika respons valid (termasuk nilai 0), fallback ke DB
-                const alistBytes = alistStats.status === 'fulfilled' ? alistStats.value.total_bytes : null;
-                const usedBytes = (alistBytes != null) ? alistBytes : total_bytes;
+                // Use only database bytes (Google Drive real data)
+                const usedBytes = total_bytes || 0;
                 const usedGB = (usedBytes / (1024 ** 3)).toFixed(2);
                 const totalGB = ((limit_bytes || (1024 ** 4)) / (1024 ** 3)).toFixed(0);
                 storageEl.textContent = `${usedGB} / ${totalGB} GB`;
@@ -1556,7 +1528,7 @@ async function loadStorageStats() {
                 }
             }
 
-            // 2. Today's Usage (tetap dari DB)
+            // 2. Today's Usage (from database)
             const todayEl = document.getElementById('stat-storage-today');
             if (todayEl) {
                 if (today_bytes >= 1024 ** 2) {
@@ -1567,201 +1539,33 @@ async function loadStorageStats() {
             }
         }
 
-        // 3. Total Arsip — dari Alist (file nyata di Terabox)
+        // 3. Total Arsip — dari Google Drive / Database (UPDATED: Tidak pakai Alist lagi)
         const invoiceEl = document.getElementById('stat-invoice');
-        if (invoiceEl && alistStats.status === 'fulfilled') {
-            const count = alistStats.value.total_files ?? 0;
-            invoiceEl.textContent = count.toLocaleString('id-ID');
-            _alistInvoiceLoaded = true; // jangan timpa dengan data DB
+        
+        // Get from database instead of Alist
+        try {
+            const response = await API.get('/api/files');
+            // Response is { files: [], total, page, limit, totalPages }
+            const invoiceCount = response.total || 0;  // Use total from response which already filters INVOICE for admin_zona
+            if (invoiceEl) {
+                invoiceEl.textContent = invoiceCount.toLocaleString('id-ID');
+                _alistInvoiceLoaded = true;
+            }
+        } catch (err) {
+            console.warn('Failed to load invoice count from database:', err);
+            // Fallback: use Alist if available
+            if (invoiceEl && alistStats.status === 'fulfilled') {
+                const count = alistStats.value.total_files ?? 0;
+                invoiceEl.textContent = count.toLocaleString('id-ID');
+                _alistInvoiceLoaded = true;
+            }
         }
     } catch (err) {
         console.warn('Failed to load storage stats:', err);
     }
 }
 
-// ---- Analytics Chart ----
-let analyticsChartInstance = null;
-async function loadAnalyticsChart() {
-    try {
-        const stats = await API.get('/api/stats/chart');
-        console.log('[DEBUG_CHART] Frontend received stats:', stats);
-        const ctx = document.getElementById('analyticsChart');
-        if (!ctx) return;
 
-        // ========== ADMIN ZONA: Single-Zone Premium Card ==========
-        const isZoneAdmin = currentUser?.role === 'admin_zona';
-        if (isZoneAdmin && stats.labels?.length <= 2) {
-            const chartCard = ctx.closest('.glass-card');
-            if (!chartCard) return;
-
-            const zoneName = stats.labels[0] || 'Zona Anda';
-            const totalValue = stats.values[0] || 0;
-            const formatted = new Intl.NumberFormat('id-ID', {
-                style: 'currency', currency: 'IDR',
-                minimumFractionDigits: 0, maximumFractionDigits: 0
-            }).format(totalValue);
-            const invoiceCount = (typeof archives !== 'undefined' ? archives : []).filter(a => a.category === 'INVOICE').length;
-            const piutangCount = (typeof archives !== 'undefined' ? archives : []).filter(a => a.category === 'PIUTANG').length;
-
-            chartCard.style.background = 'linear-gradient(180deg, rgba(16,185,129,0.05) 0%, transparent 100%)';
-            chartCard.style.borderColor = 'rgba(16,185,129,0.15)';
-            chartCard.innerHTML = `
-                <div class="flex items-center justify-between mb-5">
-                    <h3 class="text-gray-900 font-semibold text-sm flex items-center gap-2">
-                        <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                        </svg>
-                        Ringkasan Invoice — ${zoneName}
-                    </h3>
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 tracking-wider uppercase">Zona Anda</span>
-                </div>
-                <div class="rounded-2xl p-6 border border-emerald-500/10 mb-4"
-                     style="background: linear-gradient(135deg, rgba(16,185,129,0.06) 0%, rgba(16,185,129,0.01) 100%);">
-                    <p class="text-xs text-emerald-400/70 font-medium uppercase tracking-wider mb-2">Total Nilai Invoice Merah</p>
-                    <p class="text-3xl md:text-4xl font-bold text-gray-900 tracking-tight">${formatted}</p>
-                    <div class="flex items-center gap-2 mt-3">
-                        <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold bg-red-500/15 text-red-400 border border-red-500/20">
-                            📄 ${invoiceCount} Invoice
-                        </span>
-                    </div>
-                </div>
-            `;
-            return;
-        }
-
-        if (analyticsChartInstance) {
-            analyticsChartInstance.destroy();
-        }
-
-        // Create gradient fill
-        const chartCtx = ctx.getContext('2d');
-        const gradient = chartCtx.createLinearGradient(0, 0, 0, 300);
-        gradient.addColorStop(0, 'rgba(239, 68, 68, 0.7)');
-        gradient.addColorStop(0.5, 'rgba(239, 68, 68, 0.4)');
-        gradient.addColorStop(1, 'rgba(239, 68, 68, 0.1)');
-
-        const hoverGradient = chartCtx.createLinearGradient(0, 0, 0, 300);
-        hoverGradient.addColorStop(0, 'rgba(239, 68, 68, 0.95)');
-        hoverGradient.addColorStop(1, 'rgba(239, 68, 68, 0.5)');
-
-        analyticsChartInstance = new Chart(ctx, {
-            type: 'bar',
-            data: {
-                labels: stats.labels,
-                datasets: [{
-                    label: 'Total Nilai Invoice (Rp)',
-                    data: stats.values,
-                    backgroundColor: gradient,
-                    borderColor: 'rgba(239, 68, 68, 0.6)',
-                    borderWidth: 1.5,
-                    borderRadius: 6,
-                    borderSkipped: false,
-                    hoverBackgroundColor: hoverGradient,
-                    hoverBorderColor: 'rgb(239, 68, 68)',
-                    hoverBorderWidth: 2,
-                    barPercentage: 0.7,
-                    categoryPercentage: 0.8
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                interaction: {
-                    mode: 'index',
-                    intersect: false,
-                },
-                animation: {
-                    duration: 800,
-                    easing: 'easeOutQuart'
-                },
-                plugins: {
-                    legend: {
-                        display: true,
-                        position: 'top',
-                        align: 'end',
-                        labels: {
-                            color: '#4b5563',
-                            font: { family: "'Inter', sans-serif", size: 11, weight: '500' },
-                            usePointStyle: true,
-                            pointStyle: 'rectRounded',
-                            padding: 16
-                        }
-                    },
-                    tooltip: {
-                        backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                        titleColor: '#f1f5f9',
-                        bodyColor: '#e2e8f0',
-                        borderColor: 'rgba(239, 68, 68, 0.3)',
-                        borderWidth: 1,
-                        cornerRadius: 10,
-                        padding: 12,
-                        titleFont: { family: "'Inter', sans-serif", weight: '600', size: 13 },
-                        bodyFont: { family: "'Inter', sans-serif", size: 12 },
-                        displayColors: false,
-                        callbacks: {
-                            title: function (items) {
-                                return '📍 ' + items[0].label;
-                            },
-                            label: function (context) {
-                                const val = context.parsed.y;
-                                if (val === 0) return '  Belum ada data';
-                                const formatted = new Intl.NumberFormat('id-ID', {
-                                    style: 'currency', currency: 'IDR',
-                                    minimumFractionDigits: 0, maximumFractionDigits: 0
-                                }).format(val);
-                                return '  💰 ' + formatted;
-                            },
-                            afterLabel: function (context) {
-                                const val = context.parsed.y;
-                                if (val === 0) return '';
-                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                const pct = ((val / total) * 100).toFixed(1);
-                                return '  📊 ' + pct + '% dari total';
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        border: { display: false },
-                        grid: {
-                            color: 'rgba(0,0,0,0.05)',
-                            drawTicks: false
-                        },
-                        ticks: {
-                            color: '#4b5563',
-                            font: { family: "'Inter', sans-serif", size: 10, weight: '500' },
-                            padding: 8,
-                            callback: function (value) {
-                                if (value === 0) return 'Rp 0';
-                                if (value >= 1000000000) return 'Rp ' + (value / 1000000000).toLocaleString('id-ID', { maximumFractionDigits: 1 }) + ' M';
-                                if (value >= 1000000) return 'Rp ' + (value / 1000000).toLocaleString('id-ID', { maximumFractionDigits: 0 }) + ' Jt';
-                                if (value >= 1000) return 'Rp ' + (value / 1000).toLocaleString('id-ID', { maximumFractionDigits: 0 }) + ' Rb';
-                                return 'Rp ' + value.toLocaleString('id-ID');
-                            }
-                        }
-                    },
-                    x: {
-                        border: { display: false },
-                        grid: { display: false },
-                        ticks: {
-                            color: '#4b5563',
-                            font: { family: "'Inter', sans-serif", size: 10, weight: '500' },
-                            autoSkip: false,
-                            maxRotation: 45,
-                            minRotation: 45,
-                            padding: 4
-                        }
-                    }
-                }
-            }
-        });
-    } catch (err) {
-        console.warn('Failed to load chart:', err);
-    }
-}
 
 // ---- Soft Delete / Hard Delete (Super Admin) ----
 async function deleteArchive(id, fileName, isHardDelete = false) {
@@ -2440,4 +2244,122 @@ function syncSearch(value) {
     // Trigger search logic
     currentPage = 1;
     loadArchives();
+}
+
+// ============================================================
+// HELPER FUNCTIONS - Labels & Metadata
+// ============================================================
+
+/**
+ * Get combined display labels for file category + PPN type
+ * Handles both old format (category=NON_PPN) and new format (category=INVOICE, tipe_ppn=NON)
+ */
+function getCategoryBadges(category, tipe_ppn) {
+    console.log('[getCategoryBadges] Input:', { category, tipe_ppn });
+    
+    // Handle INVOICE category
+    if (category === 'INVOICE') {
+        const typeName = tipe_ppn === 'PPN' || tipe_ppn === 'NON_PPN' ? 'PPN' : 'NON';
+        const result = {
+            typeLabel: typeName,
+            categoryLabel: 'Invoice Merah'
+        };
+        console.log('[getCategoryBadges] Result:', result);
+        return result;
+    }
+    
+    // Handle legacy format where category is NON_PPN or PPN
+    if (category === 'NON_PPN' || category === 'NON') {
+        const result = {
+            typeLabel: 'NON',
+            categoryLabel: 'Invoice Merah'
+        };
+        console.log('[getCategoryBadges] Result (legacy NON):', result);
+        return result;
+    }
+    
+    if (category === 'PPN') {
+        const result = {
+            typeLabel: 'PPN',
+            categoryLabel: 'Invoice Merah'
+        };
+        console.log('[getCategoryBadges] Result (legacy PPN):', result);
+        return result;
+    }
+    
+    // For PIUTANG, no type badge
+    const result = {
+        typeLabel: null,
+        categoryLabel: category === 'PIUTANG' || category === 'BUKTI PIUTANG' ? 'Bukti Piutang' : category
+    };
+    console.log('[getCategoryBadges] Result (other):', result);
+    return result;
+}
+
+/**
+ * Get combined display label for file category + PPN type
+ * Examples: "Invoice Merah - PPN", "Invoice Putih - NON", "Bukti Piutang"
+ */
+function getCombinedCategoryLabel(category, tipe_ppn) {
+    // For INVOICE category, combine with PPN type
+    if (category === 'INVOICE') {
+        if (tipe_ppn === 'PPN') {
+            return 'Invoice Merah - PPN';
+        } else if (tipe_ppn === 'NON' || tipe_ppn === 'NON_PPN') {
+            return 'Invoice Putih - NON';
+        } else {
+            return 'Invoice Merah'; // Fallback
+        }
+    }
+    
+    // For other categories, just return category label
+    const labels = {
+        'PIUTANG': 'Bukti Piutang',
+        'BUKTI PIUTANG': 'Bukti Piutang'
+    };
+    return labels[category] || category;
+}
+
+/**
+ * Get display label for file category
+ */
+function getCategoryLabel(category) {
+    const labels = {
+        'INVOICE': 'Invoice Merah',
+        'PIUTANG': 'Bukti Piutang',
+        'BUKTI PIUTANG': 'Bukti Piutang'
+    };
+    return labels[category] || category;
+}
+
+/**
+ * Get display label for PPN type
+ */
+function getTipePPNLabel(tipe_ppn) {
+    const labels = {
+        'PPN': 'PPN',
+        'NON': 'NON',
+        'NON_PPN': 'NON'
+    };
+    return labels[tipe_ppn] || tipe_ppn;
+}
+
+/**
+ * Extract nominal (Rp value) from filename
+ * Looks for patterns like "13.242.200", "1.521.000" (dot-separated numbers)
+ * Returns formatted string like "Rp 13.242.200" or null if not found
+ */
+function extractNominalFromFilename(filename) {
+    if (!filename) return null;
+    
+    // Pattern: digits with dots, e.g., "13.242.200" or "1.521.000"
+    // Match 1-2 digits, then (dot + 3 digits) repeated 1-3 times
+    const nominalMatch = filename.match(/\b(\d{1,2}(?:\.\d{3})+)\b/);
+    
+    if (nominalMatch) {
+        const nominal = nominalMatch[1];
+        return `Rp ${nominal}`;
+    }
+    
+    return null;
 }

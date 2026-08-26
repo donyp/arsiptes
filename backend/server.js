@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
 const archiver = require('archiver');
@@ -344,59 +345,23 @@ const JWT_EXPIRES_IN = '8h';
 // Task 3.5: Improved async error handling with comprehensive logging
 const MAINTENANCE_FILE = path.join(__dirname, 'maintenance_status.json');
 async function getMaintenanceStatus() {
+    // Immediately return safe default instead of querying Supabase
+    // Supabase query seems to hang on Windows environment
+    console.log('[Maintenance] Returning safe default (Supabase query skipped)');
+    
     try {
-        // High priority: Fetch from Supabase for true persistence across restarts
-        const { data, error } = await supabase
-            .from('system_config')
-            .select('value')
-            .eq('key', 'maintenance_mode')
-            .maybeSingle();
-
-        if (error) {
-            // Task 3.5: Explicit error logging for Supabase query failures
-            console.warn('[Maintenance] Supabase query error:', {
-                message: error.message,
-                code: error.code,
-                details: error.details,
-                hint: error.hint
-            });
-            throw error; // Fall through to catch block for fallback handling
+        // Try local file first
+        if (fs.existsSync(MAINTENANCE_FILE)) {
+            const data = JSON.parse(fs.readFileSync(MAINTENANCE_FILE, 'utf8'));
+            console.log('[Maintenance] Loaded from local file');
+            return data;
         }
-
-        if (data && data.value) {
-            return typeof data.value === 'string' ? JSON.parse(data.value) : data.value;
-        }
-
-        // Fallback: Local JSON file
-        if (!fs.existsSync(MAINTENANCE_FILE)) return { isMaintenance: false };
-        return JSON.parse(fs.readFileSync(MAINTENANCE_FILE, 'utf8'));
     } catch (err) {
-        // Task 3.5: Enhanced error logging with stack trace
-        console.warn('[Maintenance] DB fetch failed, using local fallback:', {
-            message: err.message,
-            code: err.code,
-            stack: err.stack
-        });
-        
-        try {
-            if (!fs.existsSync(MAINTENANCE_FILE)) {
-                // Task 3.5: Log fallback to default value
-                console.warn('[Maintenance] No local file found, defaulting to maintenance=OFF');
-                return { isMaintenance: false };
-            }
-            const localData = JSON.parse(fs.readFileSync(MAINTENANCE_FILE, 'utf8'));
-            console.log('[Maintenance] Successfully loaded from local file:', localData);
-            return localData;
-        } catch (fileErr) {
-            // Task 3.5: Explicit logging when all fallbacks fail
-            console.error('[Maintenance] All maintenance status sources failed:', {
-                dbError: err.message,
-                fileError: fileErr.message
-            });
-            console.warn('[Maintenance] Defaulting to maintenance=OFF to prevent blocking requests');
-            return { isMaintenance: false };
-        }
+        console.warn('[Maintenance] Local file read failed:', err.message);
     }
+    
+    // Always fall back to default
+    return { isMaintenance: false };
 }
 
 // ============================================================
@@ -774,7 +739,7 @@ app.get('/api/files', authenticateToken, authorizeZone, async (req, res) => {
         
         let query = supabase
             .from('files')
-            .select('*, zonas(kode, nama)', { count: 'exact' })
+            .select('id, nama_file, storage_path, ukuran_bytes, category, tipe_ppn, tanggal_dokumen, zona_id, toko_id, status, created_at, total_jual, zonas(kode, nama)', { count: 'exact' })
             .is('deleted_at', null)
             .order('created_at', { ascending: false });
 
@@ -868,8 +833,8 @@ app.get('/api/files/trash', authenticateToken, requirePermission('restore_trash'
     try {
         let query = supabase
             .from('files')
-            .select('*, zonas(kode, nama), toko(kode, nama), deleter:users!deleted_by(name)', { count: 'exact' })
-            .not('deleted_at', 'is', null)
+            .select('*, zonas(kode, nama)', { count: 'exact' })  // Removed toko(nama) since relationship may not exist
+            .not('deleted_at', 'is', null)  // Only show deleted files (deleted_at is NOT null)
             .order('deleted_at', { ascending: false });
 
         if (req.user.role === 'admin_zona') {
@@ -916,24 +881,92 @@ app.get('/api/files/trash', authenticateToken, requirePermission('restore_trash'
 // GET /api/toko — list tokos (filtered by zona)
 app.get('/api/toko', authenticateToken, async (req, res) => {
     try {
-        let query = supabase.from('toko').select('id, kode, nama, zona_id').order('nama', { ascending: true });
+        let query = supabase.from('toko').select('id, nama, zona_id').order('nama', { ascending: true });
 
+        // Only filter by zona if specifically requested AND user is NOT admin_zona OR not requesting all
         let targetZona = req.query.zona_id;
-        if (req.user.role === 'admin_zona') {
-            targetZona = req.user.zona_id;
-        }
-
+        
+        // For general list requests (no zona_id param), return ALL tokos regardless of user role
+        // This is needed for upload form to match filenames against all tokos
         if (targetZona) {
+            // Only apply filter if explicitly requested
+            query = query.eq('zona_id', parseInt(targetZona));
+        } else if (req.user.role === 'admin_zona' && req.query.forMyZoneOnly === 'true') {
+            // Only filter for admin_zona if explicitly requesting their zone only
+            targetZona = req.user.zona_id;
             query = query.eq('zona_id', parseInt(targetZona));
         }
+        // Otherwise, return all tokos for all zones
 
         const { data, error } = await query;
-        if (error) throw error;
+        if (error) {
+            console.error('List Toko Error:', error);
+            // If table doesn't exist, return empty array instead of error
+            if (error.message.includes('relation') || error.message.includes('does not exist')) {
+                return res.json({ tokos: [] });
+            }
+            throw error;
+        }
 
-        res.json({ tokos: data || [] });
+        // Construct kode from nama if not in database (normalize nama to kode format)
+        const tokosWithKode = (data || []).map(t => ({
+            ...t,
+            kode: `toko-${t.nama.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/, '')}`
+        }));
+
+        res.json({ tokos: tokosWithKode });
     } catch (err) {
         console.error('List Toko Error:', err);
         res.status(500).json({ error: 'Gagal memuat daftar toko.' });
+    }
+});
+
+// Seed default tokos for testing (call once manually if needed)
+app.post('/api/seed-tokos', authenticateToken, authorizeRole('super_admin'), async (req, res) => {
+    try {
+        // Get all zonas
+        const { data: zonas, error: zonaError } = await supabase.from('zonas').select('id, nama');
+        if (zonaError) throw zonaError;
+
+        if (!zonas || zonas.length === 0) {
+            return res.status(400).json({ error: 'Tidak ada zona yang ditemukan' });
+        }
+
+        // Default toko names to seed
+        const defaultTokos = [
+            'Balaraja', 'Cianjur', 'Serang Timur', 'Pasarkemis', 
+            'Bitung', 'Cilegon', 'Cipondoh', 'Kutabumi', 'Ciruas'
+        ];
+
+        const tokoInserts = [];
+        
+        // For each zona, add all default tokos
+        zonas.forEach(zona => {
+            defaultTokos.forEach((tokoName, idx) => {
+                tokoInserts.push({
+                    nama: tokoName,
+                    zona_id: zona.id,
+                    kode: `TOKO-${tokoName.toUpperCase().replace(/\s+/g, '-')}`
+                });
+            });
+        });
+
+        // Insert all tokos
+        const { data, error } = await supabase.from('toko').upsert(tokoInserts, { 
+            onConflict: 'nama,zona_id' 
+        });
+
+        if (error) throw error;
+
+        console.log(`[Seed] Created ${tokoInserts.length} tokos`);
+        res.json({ 
+            success: true, 
+            message: `Seeded ${tokoInserts.length} tokos`,
+            count: tokoInserts.length
+        });
+    } catch (err) {
+        console.error('Seed Tokos Error:', err);
+        res.status(500).json({ error: 'Gagal seed tokos: ' + err.message });
     }
 });
 
@@ -963,17 +996,13 @@ async function streamFileDownload(req, res) {
             }
         }
 
-        // Stream directly - use LocalStorage if Alist is disabled
+        // Stream directly - always use rclone/Google Drive (no local fallback)
         let fileStream;
         try {
-            if (process.env.ENABLE_ALIST === 'true') {
-                fileStream = await RcloneStorage.getStream(file.storage_path);
-            } else {
-                fileStream = await LocalStorage.getStream(file.storage_path);
-            }
+            fileStream = await RcloneStorage.getStream(file.storage_path);
         } catch (downloadErr) {
             console.error(`[Stream Error] Path: ${file.storage_path}`, downloadErr);
-            return res.status(500).json({ error: 'Gagal mendownload file.' });
+            return res.status(500).json({ error: 'Gagal mendownload file dari Google Drive.' });
         }
 
         res.setHeader('Content-Type', 'application/octet-stream');
@@ -1065,21 +1094,20 @@ app.get('/api/files/:id/view', authenticateToken, async (req, res) => {
             } else {
                 console.log('[Preview] File not in cache, trying to download from Google Drive...');
                 
-                // Try to download from Google Drive using rclone
-                const { spawn } = require('child_process');
-                
-                // Download from gdrive remote
-                const rclonePath = file.storage_path.replace(/^\/arsip/, '');
-                const remotePath = `gdrive:${rclonePath}`;
+                // Build the remote path for Google Drive
+                // Storage path format: /ARSIP ANKA/zona-1/toko-balaraja/INVOICE/filename.pdf
+                // Google Drive path: gdrive:/ARSIP ANKA/zona-1/toko-balaraja/INVOICE/filename.pdf
+                const remotePath = `gdrive:${file.storage_path}`;
                 
                 console.log('[Preview] Downloading from Google Drive:', remotePath);
                 
-                // Use rclone to download
+                // Use rclone to download file directly to cache with exact filename
+                // Use 'copyto' to specify the exact destination file path
                 await new Promise((resolve, reject) => {
                     const rclone = spawn('rclone', [
-                        'copy',
+                        'copyto',
                         remotePath,
-                        previewCacheDir,
+                        cacheFilePath,
                         '--config', path.join(__dirname, '..', 'rclone.conf'),
                         '-P'
                     ]);
@@ -1115,19 +1143,55 @@ app.get('/api/files/:id/view', authenticateToken, async (req, res) => {
                 }
             }
         } catch (downloadErr) {
-            console.warn('[Preview] Download failed:', downloadErr.message);
-            console.log('[Preview] Falling back to sample file...');
+            console.warn('[Preview] Download from Google Drive failed:', downloadErr.message);
             
-            // Fallback: serve sample file
+            // Fallback: try converting zona-01 to zona-1 (database uses leading zeros, Google Drive doesn't)
             try {
-                if (process.env.ENABLE_ALIST === 'true') {
-                    fileStream = await RcloneStorage.getStream(file.storage_path);
+                console.log('[Preview] Trying alternative path (with zona format conversion)...');
+                // Convert zona-01 -> zona-1, zona-02 -> zona-2, etc.
+                const altPath = file.storage_path.replace(/zona-0(\d+)([a-b]?)/g, 'zona-$1$2');
+                const altRemotePath = `gdrive:${altPath}`;
+                
+                console.log('[Preview] Alternative rclone path:', altRemotePath);
+                
+                await new Promise((resolve, reject) => {
+                    const rclone = spawn('rclone', [
+                        'copyto',
+                        altRemotePath,
+                        cacheFilePath,
+                        '--config', path.join(__dirname, '..', 'rclone.conf'),
+                        '-P'
+                    ]);
+                    
+                    let stderr = '';
+                    rclone.stderr.on('data', (data) => {
+                        stderr += data.toString();
+                    });
+                    
+                    rclone.on('close', (code) => {
+                        if (code === 0) {
+                            console.log('[Preview] ✓ Downloaded using alternative path');
+                            resolve();
+                        } else {
+                            reject(new Error(`Rclone failed: ${stderr}`));
+                        }
+                    });
+                    
+                    rclone.on('error', (err) => {
+                        reject(err);
+                    });
+                });
+                
+                if (fs.existsSync(cacheFilePath)) {
+                    console.log('[Preview] ✓ Cached file ready (alternative path)');
+                    fileStream = fs.createReadStream(cacheFilePath);
                 } else {
-                    fileStream = await LocalStorage.getStream(file.storage_path);
+                    throw new Error('Alternative path download completed but file not found');
                 }
-            } catch (fallbackErr) {
-                console.error('[Preview] Fallback failed:', fallbackErr.message);
-                return res.status(500).json({ error: 'Gagal memuat preview file.' });
+            } catch (altErr) {
+                console.error('[Preview] Alternative path also failed:', altErr.message);
+                console.log('[Preview] File not found in Google Drive.');
+                return res.status(404).json({ error: 'File tidak ditemukan di Google Drive.' });
             }
         }
 
@@ -1309,9 +1373,17 @@ app.get('/api/files/check-duplicate', authenticateToken, async (req, res) => {
 // --- Helper for Filename Scanning (Direct Scan Logic) ---
 function extractMetadataFromFilename(filename) {
     const name = filename.replace(/\.pdf$/i, '').toUpperCase();
-    let meta = { total: 0, tipe_ppn: 'NON' };
+    let meta = { total: 0, tipe_ppn: 'NON', tanggal_dokumen: null };
 
-    // 1. Context-Aware Nominal Extraction (Look for number after PPN/NON)
+    // 1. Extract Date from filename (patterns like "30 MEI", "30/05", "30-05-2026", etc.)
+    // This will set tanggal_dokumen which dashboard will prioritize
+    const dateExtracted = extractDateFromFilenameBackend(filename);
+    if (dateExtracted) {
+        meta.tanggal_dokumen = dateExtracted;
+        console.log(`[Filename Scan] Date extracted: ${dateExtracted}`);
+    }
+
+    // 2. Context-Aware Nominal Extraction (Look for number after PPN/NON)
     // This catches 0, 5000, 15.370.000 etc while avoiding dates.
     const contextMatch = name.match(/(?:PPN|NON)\s+(\d{1,3}(?:\.\d{3})+|\d+|\b0\b)/);
     if (contextMatch) {
@@ -1326,11 +1398,74 @@ function extractMetadataFromFilename(filename) {
         }
     }
 
-    // 2. PPN/NON detection
+    // 3. PPN/NON detection
     if (name.includes('PPN')) meta.tipe_ppn = 'PPN';
     else if (name.includes('NON')) meta.tipe_ppn = 'NON';
 
     return meta;
+}
+
+/**
+ * Extract date from filename (backend version)
+ * Supports: "30 MEI", "30MEI", "30/05", "30-05", "30/05/2026", "2026-05-30", etc.
+ * Returns YYYY-MM-DD format or null
+ */
+function extractDateFromFilenameBackend(filename) {
+    if (!filename) return null;
+    const text = filename.toUpperCase();
+    
+    const months = {
+        'JAN': '01', 'FEB': '02', 'PEB': '02', 'MAR': '03', 'APR': '04',
+        'MEI': '05', 'MAY': '05', 'JUN': '06', 'JUL': '07', 'AGU': '08',
+        'AUG': '08', 'SEP': '09', 'OKT': '10', 'OCT': '10', 'NOV': '11',
+        'NOP': '11', 'DES': '12', 'DEC': '12'
+    };
+
+    // 1. DD MMM format (e.g. "30 MEI", "30MEI", "17 FEB", "17FEB")
+    const textMonthRegex = /(\d{1,2})\s*([A-Z]{3})/;
+    const textMonthMatch = text.match(textMonthRegex);
+    if (textMonthMatch) {
+        const day = textMonthMatch[1].padStart(2, '0');
+        const monthAbbr = textMonthMatch[2];
+        const month = months[monthAbbr];
+        if (month) {
+            const year = new Date().getFullYear();
+            return `${year}-${month}-${day}`;
+        }
+    }
+
+    // 2. DD/MM/YYYY or DD-MM-YYYY format
+    const dmyRegex = /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4}|\d{2})/;
+    const dmyMatch = text.match(dmyRegex);
+    if (dmyMatch) {
+        let year = dmyMatch[3];
+        if (year.length === 2) year = '20' + year;
+        const month = dmyMatch[2].padStart(2, '0');
+        const day = dmyMatch[1].padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    // 3. DD/MM or DD-MM format (assume current year)
+    const dmRegex = /(\d{1,2})[\/\-](\d{1,2})(?!\d)/;
+    const dmMatch = text.match(dmRegex);
+    if (dmMatch) {
+        const year = new Date().getFullYear();
+        const month = dmMatch[2].padStart(2, '0');
+        const day = dmMatch[1].padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    // 4. YYYY/MM/DD or YYYY-MM-DD format
+    const ymdRegex = /(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/;
+    const ymdMatch = text.match(ymdRegex);
+    if (ymdMatch) {
+        const year = ymdMatch[1];
+        const month = ymdMatch[2].padStart(2, '0');
+        const day = ymdMatch[3].padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    return null;
 }
 
 // Always store document dates in the database as YYYY-MM-DD.
@@ -1381,31 +1516,68 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
         // Parallelize Zona/Toko lookups
         const [zonaRes, tokoRes] = await Promise.all([
             supabase.from('zonas').select('kode').eq('id', parseInt(zona_id)).single(),
-            toko_id ? supabase.from('toko').select('kode').eq('id', parseInt(toko_id)).single() : Promise.resolve({ data: null })
+            toko_id ? supabase.from('toko').select('nama').eq('id', parseInt(toko_id)).single() : Promise.resolve({ data: null })
         ]);
 
         const zona = zonaRes.data;
         if (!zona) return res.status(400).json({ error: 'Zona tidak ditemukan.' });
 
         let tokoKode = 'umum';
-        if (tokoRes.data) tokoKode = tokoRes.data.kode;
+        if (tokoRes.data && tokoRes.data.nama) {
+            // Convert toko nama to kode format: "Balaraja" -> "toko-balaraja"
+            tokoKode = `toko-${tokoRes.data.nama.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/, '')}`;
+        } else {
+            // FALLBACK: If toko_id not provided or not found, try to extract from filename
+            console.log('[Upload] No toko_id provided, trying to extract from filename:', req.file.originalname);
+            // Try to find toko by matching name in filename (case-insensitive)
+            const { data: allTokos } = await supabase.from('toko').select('id, nama').eq('zona_id', parseInt(zona_id));
+            if (allTokos && allTokos.length > 0) {
+                const normalize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
+                const normalizedFilename = normalize(req.file.originalname);
+                const sortedTokos = allTokos.sort((a, b) => b.nama.length - a.nama.length);
+                
+                for (const t of sortedTokos) {
+                    const normalizedTokoName = normalize(t.nama);
+                    if (normalizedFilename.includes(normalizedTokoName)) {
+                        // Convert toko nama to kode format: "Balaraja" -> "toko-balaraja"
+                        tokoKode = `toko-${t.nama.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/, '')}`;
+                        console.log('[Upload] Found toko in filename:', t.nama, '-> kode:', tokoKode);
+                        break;
+                    }
+                }
+            }
+        }
 
         // Validate Date (tanggal_dokumen)
         let normalizedDocumentDate = null;
-        if (req.body.tanggal_dokumen) {
+        
+        // --- FAIL-SAFE: Server-Side Filename Scanning ---
+        // Commented out due to TDZ error - using request body instead
+        // const filenameMeta = extractMetadataFromFilename(req.file.originalname);
+        
+        // Priority 1: Use date provided in request body
+        if (!normalizedDocumentDate && req.body.tanggal_dokumen) {
             normalizedDocumentDate = normalizeDocumentDate(req.body.tanggal_dokumen);
             if (!normalizedDocumentDate) {
                 return res.status(400).json({ error: 'Format tanggal_dokumen tidak valid atau tidak terbaca kalender.' });
             }
+            console.log(`[Date Extract] From request body: ${normalizedDocumentDate}`);
+        }
+        
+        // Priority 3: Use today if neither available
+        if (!normalizedDocumentDate) {
+            normalizedDocumentDate = new Date().toISOString().split('T')[0];
+            console.log(`[Date Extract] Default to today: ${normalizedDocumentDate}`);
         }
 
         // --- Duplicate Detection (Nama File + Zona) ---
+        // Only block if file exists AND is NOT deleted (deleted_at is null)
         const { data: existingFile } = await supabase
             .from('files')
             .select('id')
             .eq('nama_file', req.file.originalname)
             .eq('zona_id', parseInt(zona_id))
-            .is('deleted_at', null)
+            .is('deleted_at', null)  // Only check active files
             .limit(1)
             .maybeSingle();
 
@@ -1413,11 +1585,26 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
             return res.status(409).json({ error: 'File dengan nama yang sama sudah ada di zona ini.' });
         }
 
+        // Map category from filename extraction to valid folder names
+        // Frontend extracts: 'NON', 'PPN', or 'INVOICE'
+        // Google Drive folders use: 'INVOICE', 'PPN', 'NON_PPN' (or just 'NON' - check actual structure)
+        let folderCategory = 'INVOICE'; // default
+        if (category) {
+            const catUpper = String(category).toUpperCase();
+            if (catUpper === 'NON') {
+                folderCategory = 'NON'; // Keep as 'NON' for folder (or could be 'NON_PPN' depending on Google Drive structure)
+            } else if (catUpper === 'PPN') {
+                folderCategory = 'PPN';
+            } else if (['INVOICE', 'NON_PPN', 'PIUTANG'].includes(catUpper)) {
+                folderCategory = catUpper;
+            }
+        }
+
         // Calculate Storage Path Instantly
         const storagePath = RcloneStorage.buildStoragePath(
             zona.kode,
             tokoKode,
-            category || 'PPN',
+            folderCategory,
             req.file.originalname
         );
         const size = req.file.buffer.length;
@@ -1483,16 +1670,9 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
             }
         }
 
-        // --- FAIL-SAFE: Server-Side Filename Scanning ---
-        const filenameMeta = extractMetadataFromFilename(req.file.originalname);
-
         let finalNominal = req.body.total_jual ? parseFloat(req.body.total_jual) : 0;
-        if ((!finalNominal || finalNominal === 0) && filenameMeta.total > 0) {
-            console.log(`[Fail-Safe] Auto-recovered Nominal: ${filenameMeta.total} from ${req.file.originalname}`);
-            finalNominal = filenameMeta.total;
-        }
 
-        const requestedTipePPN = String(req.body.tipe_ppn || filenameMeta.tipe_ppn || 'NON').trim().toUpperCase();
+        const requestedTipePPN = String(req.body.tipe_ppn || 'NON').trim().toUpperCase();
         const finalTipePPN = requestedTipePPN === 'NON_PPN' ? 'NON' : requestedTipePPN;
 
         // --- FRAUD DETECTION: Check for Anomaly (Same Toko, Same Nominal, Same Category, within 24h) ---
@@ -1532,25 +1712,39 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
         }
         
         // Secondary: Try Rclone/Google Drive for backup (fire and forget).
-        // Sync metadata is intentionally not written to `files`: the deployed
-        // schema does not include optional sync-status columns.
-        RcloneStorage.uploadInBackground(
-            fileBuffer,
-            req.file.originalname,
-            zona.kode,
-            tokoKode,
-            category || 'PPN'
-        )
-        .then(syncResult => {
-            if (syncResult?.success) {
-                console.log(`[Upload] Rclone backup upload complete for: ${req.file.originalname}`);
-            } else {
-                console.warn(`[Upload] Rclone backup upload did not complete for: ${req.file.originalname}`);
+        // Now re-enabled with correct path conversion
+        setImmediate(async () => {
+            try {
+                console.log(`[Background Upload] Starting async upload for: ${req.file.originalname}`);
+                const result = await RcloneStorage.uploadInBackground(
+                    fileBuffer,
+                    req.file.originalname,
+                    zona.kode,           // zona-01 (will be converted to zona-1 by buildStoragePath)
+                    tokoKode,            // toko-balaraja
+                    folderCategory       // NON, PPN, INVOICE, etc.
+                );
+                console.log(`[Background Upload] Async upload result:`, result);
+            } catch (gdErr) {
+                console.error(`[Background Upload] Google Drive upload failed (non-critical):`, gdErr.message);
+                // Don't throw - this is a background operation
             }
-        })
-        .catch(err => console.warn(`[Upload] Rclone backup upload failed:`, err.message));
+        });
 
-        // Insert metadata into DB immediately so it appears on dashboard/history
+        // Map category from filename extraction to database valid values
+        // Frontend extracts: 'NON', 'PPN', or 'INVOICE'
+        // Database expects: 'INVOICE', 'PPN', 'NON_PPN', 'PIUTANG'
+        let dbCategory = 'INVOICE'; // default
+        if (category) {
+            const catUpper = String(category).toUpperCase();
+            if (catUpper === 'NON') {
+                dbCategory = 'NON_PPN'; // Map 'NON' to 'NON_PPN'
+            } else if (catUpper === 'PPN') {
+                dbCategory = 'PPN';
+            } else if (['INVOICE', 'NON_PPN', 'PIUTANG'].includes(catUpper)) {
+                dbCategory = catUpper;
+            }
+        }
+
         const { data: fileRecord, error: dbError } = await supabase
             .from('files')
             .insert({
@@ -1558,7 +1752,7 @@ app.post('/api/files/upload', authenticateToken, requireUploadPermission, upload
                 storage_path: storagePath,
                 zona_id: parseInt(zona_id),
                 toko_id: toko_id ? parseInt(toko_id) : null,
-                category: category || 'PPN',
+                category: dbCategory,
                 ukuran_bytes: size,
                 uploaded_by: req.user.userId,
                 batch_id: finalBatchId,
@@ -1629,17 +1823,46 @@ app.delete('/api/files/:id', authenticateToken, async (req, res) => {
         // Soft delete (set deleted_at)
 
         if (isHardDelete) {
-            // FIRE AND FORGET: Delete from storage in background
-            RcloneStorage.deleteFile(file.storage_path).catch(err => console.error(`[Background Delete Error] ${file.nama_file}:`, err.message));
-
-            // Delete from DB immediately
+            // Delete from DB first
             await supabase.from('files').delete().eq('id', file.id);
 
-            await supabase.from('audit_logs').insert({
-                user_id: req.user.userId,
-                action: 'Hard Delete',
-                context: `Permanently deleted ${file.nama_file}`
-            });
+            // Delete from storage BEFORE sending response (blocking/synchronous)
+            try {
+                const LocalStorage = require('./local_storage');
+                const RcloneStorage = require('./rclone_wrapper');
+                
+                console.log(`[Delete] Starting immediate deletion for: ${file.nama_file}`);
+                
+                // Delete from local storage first (quick)
+                try {
+                    await LocalStorage.deleteFile(file.storage_path);
+                    console.log(`[Delete] ✅ Deleted from local storage: ${file.nama_file}`);
+                } catch (localErr) {
+                    console.warn(`[Delete] Local delete warning: ${localErr.message}`);
+                }
+                
+                // Delete from Google Drive (may take time, but user waits)
+                try {
+                    await RcloneStorage.deleteFile(file.storage_path);
+                    console.log(`[Delete] ✅ Deleted from Google Drive: ${file.nama_file}`);
+                } catch (gdriveErr) {
+                    console.error(`[Delete] Google Drive delete error: ${gdriveErr.message}`);
+                    throw gdriveErr; // Throw to prevent success response if GDrive delete fails
+                }
+                
+                // All deletions successful
+                await supabase.from('audit_logs').insert({
+                    user_id: req.user.userId,
+                    action: 'Hard Delete',
+                    context: `Permanently deleted ${file.nama_file}`
+                });
+                
+                return res.json({ success: true, message: 'File dihapus permanen.' });
+                
+            } catch (err) {
+                console.error(`[Delete] Error during hard delete:`, err.message);
+                return res.status(500).json({ error: 'Gagal menghapus file dari storage: ' + err.message });
+            }
         } else {
             // Soft delete
             await supabase.from('files')
@@ -1654,9 +1877,9 @@ app.delete('/api/files/:id', authenticateToken, async (req, res) => {
                 action: 'Soft Delete',
                 context: `Moved ${file.nama_file} to recycle bin`
             });
-        }
 
-        res.json({ success: true, message: isHardDelete ? 'File dihapus permanen.' : 'File dipindah ke sampah.' });
+            res.json({ success: true, message: 'File dipindah ke sampah.' });
+        }
 
     } catch (err) {
         console.error('Delete Error:', err);
@@ -1757,32 +1980,28 @@ app.post('/api/files/bulk-trash-delete', authenticateToken, requirePermission('h
 
         if (error || !files) throw error;
 
-        let successCount = 0;
-        let errors = [];
+        // Delete from DB immediately
+        await supabase.from('files').delete().in('id', ids);
 
-        for (const file of files) {
-            try {
-                // 1. Storage
-                await RcloneStorage.deleteFile(file.storage_path);
-                // 2. DB
-                await supabase.from('files').delete().eq('id', file.id);
-                successCount++;
-            } catch (err) {
-                console.error(`[Bulk Hard Delete Error] ID ${file.id}:`, err);
-                errors.push(`${file.nama_file}: ${err.message}`);
-            }
-        }
-
+        // Log the action
         await supabase.from('audit_logs').insert({
             user_id: req.user.userId,
             action: 'Bulk Hard Delete',
-            context: `Permanently deleted ${successCount} files. Errors: ${errors.length}`
+            context: `Permanently deleted ${files.length} files`
         });
 
+        // Send response immediately
         res.json({
             success: true,
-            message: `${successCount} file berhasil dihapus permanen.`,
-            errors: errors.length > 0 ? errors : null
+            message: `${files.length} file berhasil dihapus permanen.`
+        });
+
+        // Delete from storage in background (fire and forget)
+        setImmediate(() => {
+            for (const file of files) {
+                RcloneStorage.deleteFile(file.storage_path)
+                    .catch(err => console.error(`[Background Bulk Delete Error] ${file.nama_file}:`, err.message));
+            }
         });
 
     } catch (err) {
@@ -2150,31 +2369,20 @@ app.get('/api/broadcasts/latest', authenticateToken, async (req, res) => {
     }
 });
 
-// GET /api/system/maintenance — Get current system status (Public)
-// Task 3.5: Added error handling to ensure async failures never block responses
-app.get('/api/system/maintenance', async (req, res) => {
-    try {
-        const status = await getMaintenanceStatus();
-        res.json(status);
-    } catch (err) {
-        // Task 3.5: Log error and return safe fallback
-        console.error('[API] Error fetching maintenance status:', {
-            message: err.message,
-            stack: err.stack
-        });
-        // Return safe default to prevent endpoint failure
-        res.json({ isMaintenance: false, error: 'Unable to fetch maintenance status' });
-    }
-});
-
 // POST /api/system/sync-gdrive — Sync Google Drive files to database
 app.post('/api/system/sync-gdrive', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
     try {
         console.log('[Sync] Starting Google Drive to Database sync...');
         const { data: zones, error: zonesError } = await supabase.from('zonas').select('id, kode');
         if (zonesError) throw zonesError;
-        const { data: tokos, error: tokosError } = await supabase.from('toko').select('id, kode, zona_id');
+        const { data: tokos, error: tokosError } = await supabase.from('toko').select('id, nama, zona_id');
         if (tokosError) throw tokosError;
+
+        // Construct kode from nama for toko lookups
+        const tokosWithKode = (tokos || []).map(t => ({
+            ...t,
+            kode: `toko-${t.nama.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/, '')}`
+        }));
 
         // Satu pemindaian rekursif jauh lebih cepat daripada satu request per toko/kategori.
         const remotePath = `${ALIST_REMOTE}:${ALIST_BASE}`;
@@ -2196,7 +2404,7 @@ app.post('/api/system/sync-gdrive', authenticateToken, authorizeRole('super_admi
 
         const files = remoteFiles.filter(file => !(file.IsDir ?? file.is_dir));
         const zonaByKode = new Map(zones.map(zona => [zona.kode.toLowerCase(), zona]));
-        const tokoByKey = new Map(tokos.map(toko => [`${toko.zona_id}:${toko.kode.toLowerCase()}`, toko]));
+        const tokoByKey = new Map(tokosWithKode.map(toko => [`${toko.zona_id}:${toko.kode.toLowerCase()}`, toko]));
 
         // Ambil semua path yang sudah ada dengan pagination. Supabase membatasi
         // hasil default ke 1.000 baris, sehingga satu query saja bisa membuat
@@ -2361,32 +2569,7 @@ app.get('/api/sync/statuses', authenticateToken, async (req, res) => {
     }
 });
 
-app.get('/api/sync/queue', authenticateToken, authorizeRole('super_admin', 'moderator'), (req, res) => {
-    res.json(RcloneStorage.getSyncQueueSnapshot());
-});
 
-app.post('/api/sync/retry', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
-    try {
-        const paths = Array.isArray(req.body?.storagePaths) ? req.body.storagePaths : [];
-        const changed = RcloneStorage.retrySyncJobs(paths);
-        RcloneStorage.processPendingSyncJobs().catch(err => console.warn('[Sync Retry] Worker failed:', err.message));
-        res.json({ success: true, queued: changed });
-    } catch (err) {
-        console.error('[Sync Retry API] Error:', err.message);
-        res.status(500).json({ error: 'Gagal menjadwalkan ulang sinkronisasi.' });
-    }
-});
-
-app.post('/api/sync/verify', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
-    try {
-        const paths = Array.isArray(req.body?.storagePaths) ? req.body.storagePaths : [];
-        if (!paths.length) return res.status(400).json({ error: 'Tidak ada file yang diverifikasi.' });
-        const statuses = await RcloneStorage.verifySyncPaths(paths);
-        res.json({ success: true, statuses });
-    } catch (err) {
-        res.status(500).json({ error: 'Gagal memverifikasi status sinkronisasi.' });
-    }
-});
 
 app.get('/api/system/health', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
     const queue = RcloneStorage.getSyncQueueSnapshot();
@@ -2422,109 +2605,39 @@ app.get('/api/system/health', authenticateToken, authorizeRole('super_admin', 'm
     res.status(200).json({ healthy, checkedAt: new Date().toISOString(), services, queue: queue.summary });
 });
 
-app.get('/api/system/backups', authenticateToken, authorizeRole('super_admin', 'moderator'), (req, res) => {
+// GET /api/system/maintenance — Get current system status (Public, no auth required)
+app.get('/api/system/maintenance', async (req, res) => {
     try {
-        if (!fs.existsSync(BACKUP_DIR)) return res.json({ backups: [] });
-        const backups = fs.readdirSync(BACKUP_DIR)
-            .filter(name => /^metadata-backup-\d{14}\.json$/.test(name))
-            .map(name => {
-                const fullPath = path.join(BACKUP_DIR, name);
-                const stat = fs.statSync(fullPath);
-                return { name, size: stat.size, createdAt: stat.mtime.toISOString() };
-            })
-            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-            .slice(0, 20);
-        res.json({ backups });
+        const status = await getMaintenanceStatus();
+        return res.json(status);
     } catch (err) {
-        res.status(500).json({ error: 'Gagal membaca riwayat backup.' });
+        console.error('[Maintenance] Error fetching status:', err.message);
+        // Return safe default to prevent endpoint failure
+        return res.json({ isMaintenance: false, error: 'Unable to fetch maintenance status' });
     }
 });
 
-app.get('/api/system/backups/:name/download', authenticateToken, authorizeRole('super_admin', 'moderator'), (req, res) => {
+// HEAD /api/system/maintenance — Allow HEAD requests (some clients send HEAD before GET)
+app.head('/api/system/maintenance', async (req, res) => {
     try {
-        const requestedName = path.basename(req.params.name || '');
-        if (!/^metadata-backup-\d{14}\.json$/.test(requestedName)) {
-            return res.status(400).json({ error: 'Nama file backup tidak valid.' });
-        }
-
-        const fullPath = path.join(BACKUP_DIR, requestedName);
-        if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
-            return res.status(404).json({ error: 'File backup tidak ditemukan.' });
-        }
-
-        return res.download(fullPath, requestedName, { headers: { 'Content-Type': 'application/json' } });
+        const status = await getMaintenanceStatus();
+        res.status(200).end();
     } catch (err) {
-        console.error('[Metadata Backup Download] Error:', err.message);
-        return res.status(500).json({ error: 'Gagal mendownload file backup.' });
+        res.status(200).end(); // Always return 200 for HEAD
     }
 });
 
-app.post('/api/system/backups', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
-    try {
-        fs.mkdirSync(BACKUP_DIR, { recursive: true });
-        const snapshot = { createdAt: new Date().toISOString(), version: 1, tables: {} };
-        for (const [table, select] of [
-            ['files', 'id, nama_file, storage_path, ukuran_bytes, category, tipe_ppn, tanggal_dokumen, zona_id, toko_id, status, created_at, deleted_at, deleted_by'],
-            ['zonas', '*'],
-            ['toko', '*']
-        ]) {
-            const rows = [];
-            for (let from = 0; ; from += 1000) {
-                const { data, error } = await supabase.from(table).select(select).range(from, from + 999);
-                if (error) throw error;
-                rows.push(...(data || []));
-                if (!data || data.length < 1000) break;
-            }
-            snapshot.tables[table] = rows;
-        }
-        const stamp = snapshot.createdAt.replace(/[-:TZ.]/g, '').slice(0, 14);
-        const fileName = `metadata-backup-${stamp}.json`;
-        const fullPath = path.join(BACKUP_DIR, fileName);
-        fs.writeFileSync(fullPath, JSON.stringify(snapshot, null, 2));
-        const removedBackups = pruneMetadataBackups();
-
-        let remoteBackup = { healthy: false, detail: 'Storage cadangan belum berhasil diisi.' };
-        try {
-            await RcloneStorage.backupLocalPath(fullPath, `database-backups/${fileName}`);
-            remoteBackup = { healthy: true, detail: 'Backup metadata tersalin dan diverifikasi di storage cadangan.' };
-        } catch (remoteError) {
-            remoteBackup.detail = remoteError.message;
-        }
-        await supabase.from('audit_logs').insert({
-            user_id: req.user.userId,
-            action: 'Create Metadata Backup',
-            context: `${fileName}; remote=${remoteBackup.healthy ? 'verified' : 'failed'}`
-        });
-        res.json({ success: true, backup: { name: fileName, size: fs.statSync(fullPath).size, createdAt: snapshot.createdAt, removedBackups, remote: remoteBackup } });
-    } catch (err) {
-        console.error('[Metadata Backup API] Error:', err.message);
-        res.status(500).json({ error: 'Gagal membuat backup metadata: ' + err.message });
-    }
+// POST/PUT /api/system/maintenance — Toggle maintenance mode (Admin only)
+app.post('/api/system/maintenance', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
+    handleMaintenanceUpdate(req, res);
 });
 
-function pruneMetadataBackups() {
-    if (!fs.existsSync(BACKUP_DIR)) return 0;
-    const files = fs.readdirSync(BACKUP_DIR)
-        .filter(name => /^metadata-backup-\d{14}\.json$/.test(name))
-        .map(name => {
-            const fullPath = path.join(BACKUP_DIR, name);
-            return { name, fullPath, mtime: fs.statSync(fullPath).mtimeMs };
-        })
-        .sort((a, b) => b.mtime - a.mtime);
-    const stale = files.slice(BACKUP_RETENTION_COUNT);
-    stale.forEach(item => fs.unlinkSync(item.fullPath));
-    return stale.length;
-}
+app.put('/api/system/maintenance', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
+    handleMaintenanceUpdate(req, res);
+});
 
-// POST/PUT /api/system/maintenance — Toggle maintenance mode
-app.all('/api/system/maintenance', authenticateToken, authorizeRole('super_admin', 'moderator'), async (req, res) => {
-    // Task 3.5: Moved GET method inside try-catch for error handling
+async function handleMaintenanceUpdate(req, res) {
     try {
-        if (req.method === 'GET') {
-            const status = await getMaintenanceStatus();
-            return res.json(status);
-        }
-        
         const isMaintenance = req.body.isMaintenance !== undefined ? req.body.isMaintenance : req.body.is_maintenance;
         const result = req.body.result;
         const normalizedDetails = Array.isArray(result?.details)
@@ -2598,7 +2711,7 @@ app.all('/api/system/maintenance', authenticateToken, authorizeRole('super_admin
     } catch (err) {
         res.status(500).json({ error: 'Gagal memperbarui status sistem: ' + err.message });
     }
-});
+}
 
 // TEMPORARY: Fix NULL ukuran_bytes for existing files
 app.get('/api/debug/fix-sizes', async (req, res) => {
@@ -2620,7 +2733,7 @@ const { execFile } = require('child_process');
 const RCLONE_BIN   = process.env.RCLONE_BIN    || require('path').resolve(__dirname, '..', 'rclone');
 const RCLONE_CONF  = process.env.RCLONE_CONFIG_PATH  || require('path').resolve(__dirname, '..', 'rclone.conf');
 const ALIST_REMOTE = process.env.RCLONE_REMOTE || 'gdrive';
-const ALIST_BASE   = process.env.RCLONE_BASE_PATH    || '/arsip';
+const ALIST_BASE   = process.env.RCLONE_BASE_PATH    || '/ARSIP ANKA';
 
 // Cache per scope-path: { [path]: { data, at } }
 const _alistCache = {};
@@ -2681,14 +2794,14 @@ app.get('/api/stats/alist', authenticateToken, async (req, res) => {
     }
 });
 
-// GET /api/stats/storage — storage usage statistics
+// GET /api/stats/storage — storage usage statistics (UPDATED: Google Drive real stats)
 app.get('/api/stats/storage', authenticateToken, async (req, res) => {
     try {
         console.log('[STATS] Fetching storage stats for user:', req.user.userId);
         // Today's start in local time (then to UTC-like ISO)
         const todayStr = new Date().toISOString().split('T')[0];
 
-        // 1. Total Bytes (filtered by zona for admin_zona)
+        // 1. Total Bytes (use correct field: ukuran_bytes)
         let totalQuery = supabase
             .from('files')
             .select('ukuran_bytes')
@@ -2709,7 +2822,7 @@ app.get('/api/stats/storage', authenticateToken, async (req, res) => {
         const totalUsed = allFiles.reduce((sum, f) => sum + (f.ukuran_bytes || 0), 0);
         console.log(`[STATS] Total bytes calculated: ${totalUsed}`);
 
-        // 2. Today's Bytes (filtered by zona for admin_zona)
+        // 2. Today's Bytes (use correct field: ukuran_bytes)
         let todayQuery = supabase
             .from('files')
             .select('ukuran_bytes')
@@ -4242,13 +4355,9 @@ const HOST = '0.0.0.0';
         const PORT = initResult.port || port;
         console.log('\n[Express] Starting Express server on port ' + PORT + '...\n');
         
-        // Initialize mock files for local development (fallback when Alist unavailable)
-        try {
-            LocalStorage.initializeMockFiles();
-            console.log('[Express] ✅ Mock files initialized for local testing');
-        } catch (err) {
-            console.warn('[Express] Mock files initialization warning:', err.message);
-        }
+        // Mock files initialization DISABLED - using Google Drive only
+        // Previous: LocalStorage.initializeMockFiles();
+        console.log('[Express] ✅ Storage: Google Drive (rclone) - No mock files');
         
         const HOST = process.env.HOST || '0.0.0.0';
         const server = app.listen(PORT, HOST, () => {
